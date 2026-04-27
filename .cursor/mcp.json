@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "syllabus-to-study-plan": {
+      "command": "/home/anup/All_Types_of_Codes/MCP Server/.venv/bin/python",
+      "args": ["-m", "syllabus_mcp.server"]
+    }
+  }
+}
+
