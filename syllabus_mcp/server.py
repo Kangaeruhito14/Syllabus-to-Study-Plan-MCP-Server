@@ -72,6 +72,12 @@ class ExportPlanOutput(BaseModel):
 
 
 class CourseCorrectionInput(BaseModel):
+    class NewAssessmentInput(BaseModel):
+        name: str
+        type: AssessmentType = AssessmentType.exam
+        scheduled_date: date | None = None
+        weight_percent: float | None = None
+
     course: CourseModel
     set_course_title: str | None = None
     set_timezone: str | None = None
@@ -82,6 +88,14 @@ class CourseCorrectionInput(BaseModel):
     )
     add_topics: list[str] = Field(default_factory=list)
     remove_topics: list[str] = Field(default_factory=list)
+    remove_assessments: list[str] = Field(
+        default_factory=list,
+        description="Assessment names to remove (case-insensitive exact-name match).",
+    )
+    add_assessments: list[NewAssessmentInput] = Field(
+        default_factory=list,
+        description="Add or update assessments by name (manual exam/date correction flow).",
+    )
 
 
 class CourseCorrectionOutput(BaseModel):
@@ -137,12 +151,16 @@ def parse_syllabus(inp: ParseSyllabusInput) -> ParseSyllabusOutput:
             warnings.append("No topics detected; provide topic list manually or ensure syllabus has weekly outline.")
         if not course.assessments:
             warnings.append("No assessments detected; you may need to provide exam dates manually.")
+        if any("Week-based schedule detected" in c for c in course.constraints_found):
+            warnings.append("Syllabus appears week-based without concrete dates; use apply_course_corrections.assessment_date_overrides.")
     else:
         text = inp.content.strip()
         pages = [TextPage(page_number=1, text=text)]
         course = extract_course_model_from_pages(pages, timezone=inp.timezone)
         if not course.topics:
             warnings.append("No topics detected from text; consider pasting the weekly schedule section.")
+        if any("Week-based schedule detected" in c for c in course.constraints_found):
+            warnings.append("Syllabus appears week-based without concrete dates; use apply_course_corrections.assessment_date_overrides.")
 
     return ParseSyllabusOutput(course=course, warnings=warnings)
 
@@ -151,9 +169,13 @@ def parse_syllabus(inp: ParseSyllabusInput) -> ParseSyllabusOutput:
 def detect_exam_dates(course: CourseModel) -> DetectExamDatesOutput:
     """Refine assessments and exam dates with confidence and assumptions."""
     warnings: list[str] = []
+    blockers = ("assignment must", "blackboard", "attendance", "office hours")
     exams = []
     for a in course.assessments:
-        if a.type == AssessmentType.exam or any(k in a.name.lower() for k in ("midterm", "final", "exam", "test")):
+        name_low = a.name.lower()
+        if any(b in name_low for b in blockers):
+            continue
+        if a.type == AssessmentType.exam or any(k in name_low for k in ("midterm", "final", "exam", "test")):
             if a.scheduled_date is None:
                 warnings.append(f"Missing date for likely exam: '{a.name}'.")
             exams.append(a)
@@ -269,6 +291,55 @@ def apply_course_corrections(inp: CourseCorrectionInput) -> CourseCorrectionOutp
             warnings.append("No assessment names matched assessment_date_overrides.")
         else:
             changes.append(f"assessment_dates_updated={matched}")
+
+    if inp.add_assessments:
+        existing_by_name = {a.name.strip().lower(): a for a in course.assessments}
+        added = 0
+        updated = 0
+        for item in inp.add_assessments:
+            key = item.name.strip().lower()
+            if not key:
+                continue
+            if key in existing_by_name:
+                a = existing_by_name[key]
+                a.type = item.type
+                if item.scheduled_date is not None:
+                    a.scheduled_date = item.scheduled_date
+                if item.weight_percent is not None:
+                    a.weight_percent = item.weight_percent
+                a.confidence = Confidence(value=0.95, reason="User-added assessment details")
+                updated += 1
+                continue
+
+            course.assessments.append(
+                Assessment(
+                    name=item.name.strip(),
+                    type=item.type,
+                    scheduled_date=item.scheduled_date,
+                    weight_percent=item.weight_percent,
+                    confidence=Confidence(value=0.98, reason="User-added assessment"),
+                    source={"page": None, "line": "manual_add_assessment"},
+                )
+            )
+            existing_by_name[key] = course.assessments[-1]
+            added += 1
+
+        if added:
+            changes.append(f"assessments_added={added}")
+        if updated:
+            changes.append(f"assessments_updated={updated}")
+
+    remove_assessment_set = {a.strip().lower() for a in inp.remove_assessments if a.strip()}
+    if remove_assessment_set:
+        before = len(course.assessments)
+        course.assessments = [
+            a for a in course.assessments if a.name.strip().lower() not in remove_assessment_set
+        ]
+        removed = before - len(course.assessments)
+        if removed:
+            changes.append(f"assessments_removed={removed}")
+        else:
+            warnings.append("No assessment names matched remove_assessments.")
 
     remove_set = {t.strip().lower() for t in inp.remove_topics if t.strip()}
     if remove_set:
