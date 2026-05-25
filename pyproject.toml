@@ -23,6 +23,14 @@ dependencies = [
 [project.scripts]
 syllabus-mcp = "syllabus_mcp.server:main"
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.uv]
 dev-dependencies = [
   "pytest>=8.0.0",

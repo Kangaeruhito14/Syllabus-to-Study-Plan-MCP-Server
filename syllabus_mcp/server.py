@@ -373,61 +373,341 @@ def apply_course_corrections(inp: CourseCorrectionInput) -> CourseCorrectionOutp
 def build_plan_report(inp: BuildPlanReportInput) -> BuildPlanReportOutput:
     """
     Build a polished natural-language report for users.
+
+    Includes: exam countdown, weekly session summary, priority topics,
+    first sessions preview, and actionable adjustment tips.
     """
     course = inp.course
     plan = inp.plan
+    today = date.today()
+    md = inp.include_markdown
+
     exams = [a for a in course.assessments if a.type == AssessmentType.exam]
-    dated_exams = [a for a in exams if a.scheduled_date]
-    topics = course.topics[:8]
-    first_sessions = plan.sessions[:6]
+    dated_exams = sorted([a for a in exams if a.scheduled_date], key=lambda x: x.scheduled_date)
     total_hours = round(sum(s.estimated_minutes for s in plan.sessions) / 60, 1)
+    total_days = (plan.end_date - plan.start_date).days + 1
+    learn_count = sum(1 for s in plan.sessions if s.session_type.value == "learn")
+    review_count = sum(1 for s in plan.sessions if s.session_type.value == "review")
 
-    lines = []
-    if inp.include_markdown:
-        lines.append(f"# Study Plan for {course.course_title or 'Your Course'}")
-        lines.append("")
-        lines.append("## Snapshot")
-    lines.extend(
-        [
-            f"- Timeline: {plan.start_date.isoformat()} to {plan.end_date.isoformat()} ({len(plan.sessions)} sessions)",
-            f"- Estimated workload: {total_hours} hours total",
-            f"- Topics detected: {len(course.topics)}",
-            f"- Assessments detected: {len(course.assessments)}",
-        ]
-    )
-    if inp.include_markdown:
-        lines.append("")
-        lines.append("## Key Exams")
-    if dated_exams:
-        for a in sorted(dated_exams, key=lambda x: x.scheduled_date):
-            lines.append(f"- {a.name}: {a.scheduled_date.isoformat()}")
+    lines: list[str] = []
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    title = course.course_title or "Your Course"
+    if md:
+        lines += [f"# Study Plan — {title}", ""]
+
+    # ── Snapshot ──────────────────────────────────────────────────────────────
+    if md:
+        lines += ["## At a Glance", ""]
+    lines += [
+        f"- Course: {title}",
+        f"- Study window: {plan.start_date.isoformat()} → {plan.end_date.isoformat()} ({total_days} days)",
+        f"- Total sessions: {len(plan.sessions)}  ({learn_count} learn · {review_count} review)",
+        f"- Estimated total study time: {total_hours} hours",
+        f"- Topics in plan: {len(course.topics)}",
+        f"- Assessments tracked: {len(course.assessments)}",
+    ]
+
+    # ── Exam Countdown ────────────────────────────────────────────────────────
+    if md:
+        lines += ["", "## Exam Countdown", ""]
     else:
-        lines.append("- No exam dates confidently detected yet. Add corrections for best schedule quality.")
-
-    if inp.include_markdown:
         lines.append("")
-        lines.append("## Priority Topics")
-    for t in sorted(topics, key=lambda x: x.weight_score or 1.0, reverse=True):
-        lines.append(f"- {t.title} (weight: {t.weight_score or 1.0})")
-
-    if inp.include_markdown:
-        lines.append("")
-        lines.append("## First Sessions")
-    for s in first_sessions:
+    if dated_exams:
+        for a in dated_exams:
+            days_left = (a.scheduled_date - today).days
+            if days_left < 0:
+                tag = "(past)"
+            elif days_left == 0:
+                tag = "TODAY"
+            elif days_left == 1:
+                tag = "tomorrow"
+            else:
+                tag = f"{days_left} days away"
+            lines.append(f"- {a.name}: {a.scheduled_date.isoformat()}  [{tag}]")
+    else:
         lines.append(
-            f"- {s.session_date.isoformat()}: [{s.session_type.value}] {s.topic_title} ({s.estimated_minutes} min)"
+            "- No exam dates detected yet. "
+            "Use `apply_course_corrections` or `full_pipeline.manual_exam_dates` to add them."
         )
 
-    if inp.include_markdown:
+    # ── Weekly Summary ────────────────────────────────────────────────────────
+    if md:
+        lines += ["", "## Weekly Study Summary", ""]
+    else:
         lines.append("")
-        lines.append("## How to Adjust")
-    lines.extend(
-        [
-            "- If exam dates change, use `apply_course_corrections.assessment_date_overrides` and regenerate the plan.",
-            "- If topics are missing/noisy, use `add_topics` and `remove_topics` then rerun `weight_topics` and `generate_study_plan`.",
-        ]
-    )
+
+    from collections import defaultdict
+    week_map: dict[str, int] = defaultdict(int)
+    for s in plan.sessions:
+        week_num = s.session_date.isocalendar()[1]
+        year = s.session_date.year
+        key = f"{year}-W{week_num:02d}"
+        week_map[key] += s.estimated_minutes
+
+    shown = 0
+    for week_key in sorted(week_map.keys())[:6]:
+        mins = week_map[week_key]
+        hrs = round(mins / 60, 1)
+        lines.append(f"- {week_key}: {hrs} hrs ({mins} min)")
+        shown += 1
+    if len(week_map) > shown:
+        lines.append(f"- … and {len(week_map) - shown} more weeks")
+
+    # ── Priority Topics ───────────────────────────────────────────────────────
+    if md:
+        lines += ["", "## Priority Topics (highest weight first)", ""]
+    else:
+        lines.append("")
+
+    top_topics = sorted(course.topics, key=lambda t: t.weight_score or 1.0, reverse=True)[:8]
+    if top_topics:
+        for t in top_topics:
+            score = t.weight_score or 1.0
+            bar = "█" * min(int(score), 5) + "░" * max(0, 5 - int(score))
+            lines.append(f"- {t.title}  [{bar}] {score:.1f}")
+    else:
+        lines.append("- No topics detected. Use `apply_course_corrections.add_topics` to add them.")
+
+    # ── First Sessions ────────────────────────────────────────────────────────
+    if md:
+        lines += ["", "## Your First 7 Sessions", ""]
+    else:
+        lines.append("")
+
+    for s in plan.sessions[:7]:
+        lines.append(
+            f"- {s.session_date.isoformat()} [{s.session_type.value:8s}] "
+            f"{s.topic_title} ({s.estimated_minutes} min)"
+        )
+
+    # ── How to Adjust ─────────────────────────────────────────────────────────
+    if md:
+        lines += ["", "## How to Adjust This Plan", ""]
+    else:
+        lines.append("")
+
+    lines += [
+        "- Wrong exam dates? → call `apply_course_corrections` with `assessment_date_overrides`, then `generate_study_plan`.",
+        "- Missing topics?   → call `apply_course_corrections` with `add_topics`, then `weight_topics` + `generate_study_plan`.",
+        "- Change study hours or days off? → call `generate_study_plan` again with updated `preferences`.",
+        "- Re-sync calendar? → call `export_plan` with `format='ics'` (or `google_calendar`/`notion`) after regenerating.",
+    ]
+
     return BuildPlanReportOutput(report="\n".join(lines))
+
+
+class SetupNotionDatabaseInput(BaseModel):
+    notion_token: str = Field(description="Your Notion integration token (starts with 'secret_...').")
+    parent_page_id: str = Field(
+        description=(
+            "The Notion page ID where the database will be created. "
+            "Open the page in Notion, copy the URL — the ID is the last 32-char hex after the last '/'."
+        )
+    )
+    database_title: str = Field(default="Study Plan", description="Title for the new Notion database.")
+
+
+class SetupNotionDatabaseOutput(BaseModel):
+    database_id: str
+    database_url: str
+    message: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+@mcp.tool
+def setup_notion_database(inp: SetupNotionDatabaseInput) -> SetupNotionDatabaseOutput:
+    """
+    Create the required Notion database for study plan export.
+
+    Creates a database with all required properties:
+    Name, Date, Type, Minutes, Key, Rationale, PlanKey.
+
+    Run this once, then use the returned database_id in export_plan or full_pipeline.
+    """
+    from notion_client import Client as NotionClient
+
+    client = NotionClient(auth=inp.notion_token)
+    warnings: list[str] = []
+
+    properties: dict[str, Any] = {
+        "Name": {"title": {}},
+        "Date": {"date": {}},
+        "Type": {
+            "select": {
+                "options": [
+                    {"name": "learn", "color": "blue"},
+                    {"name": "review", "color": "green"},
+                    {"name": "practice", "color": "yellow"},
+                    {"name": "mock_exam", "color": "red"},
+                    {"name": "buffer", "color": "gray"},
+                ]
+            }
+        },
+        "Minutes": {"number": {"format": "number"}},
+        "Key": {"rich_text": {}},
+        "PlanKey": {"rich_text": {}},
+        "Rationale": {"rich_text": {}},
+    }
+
+    try:
+        db = client.databases.create(
+            parent={"type": "page_id", "page_id": inp.parent_page_id},
+            title=[{"type": "text", "text": {"content": inp.database_title}}],
+            properties=properties,
+        )
+        db_id = db["id"]
+        db_url = db.get("url", f"https://notion.so/{db_id.replace('-', '')}")
+        return SetupNotionDatabaseOutput(
+            database_id=db_id,
+            database_url=db_url,
+            message=(
+                f"Database '{inp.database_title}' created successfully. "
+                f"Use database_id='{db_id}' in export_plan or full_pipeline."
+            ),
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return SetupNotionDatabaseOutput(
+            database_id="",
+            database_url="",
+            message="Failed to create database. See warnings.",
+            warnings=[str(exc)],
+        )
+
+
+class FullPipelineInput(BaseModel):
+    content_type: Literal["pdf_base64", "text"] = Field(
+        description="Provide either base64-encoded PDF bytes or plain text."
+    )
+    content: str = Field(description="Base64 PDF bytes or syllabus text.")
+    timezone: str = Field(default="UTC", description="Your timezone, e.g. 'Asia/Kolkata'.")
+    hours_per_day: float = Field(default=1.5, description="Study hours available per day.")
+    days_off: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(
+        default_factory=list,
+        description="Days you cannot study, e.g. ['fri', 'sat'].",
+    )
+    course_start_date: date | None = Field(
+        default=None,
+        description="When to start studying. Defaults to today.",
+    )
+    manual_exam_dates: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Override or add exam dates. Key = exam name, value = date string 'YYYY-MM-DD'. "
+            "Use this when the syllabus has no explicit dates (e.g. week-based schedules)."
+        ),
+    )
+    boost_keywords: list[str] = Field(
+        default_factory=list,
+        description="Extra keywords to boost topic importance (e.g. ['networking', 'security']).",
+    )
+    export_format: Literal["ics", "json"] = Field(
+        default="ics",
+        description="Output format: 'ics' (importable calendar) or 'json' (raw data).",
+    )
+
+
+class FullPipelineOutput(BaseModel):
+    course_title: str | None
+    topics_found: int
+    assessments_found: int
+    sessions_total: int
+    plan_start: str
+    plan_end: str
+    report: str
+    export_format: str
+    export_data: Any
+    warnings: list[str] = Field(default_factory=list)
+
+
+@mcp.tool
+def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
+    """
+    One-call end-to-end pipeline: upload a syllabus and get a complete study plan.
+
+    Runs: parse → detect exam dates → apply manual corrections → weight topics →
+    generate day-by-day schedule → build readable report → export ICS or JSON.
+
+    Use manual_exam_dates to provide real dates when the syllabus is week-based
+    (no explicit calendar dates). Example: {"Final Exam": "2026-09-10"}.
+    """
+    warnings: list[str] = []
+
+    # 1) Parse
+    parse_out = parse_syllabus(ParseSyllabusInput(
+        content_type=inp.content_type,
+        content=inp.content,
+        timezone=inp.timezone,
+    ))
+    warnings.extend(parse_out.warnings)
+
+    # 2) Detect exam dates
+    detect_out = detect_exam_dates(parse_out.course)
+    warnings.extend(detect_out.warnings)
+
+    # 3) Apply manual exam date overrides / additions (if provided)
+    course = detect_out.course
+    if inp.manual_exam_dates:
+        parsed_overrides: dict[str, date] = {}
+        new_assessments: list[CourseCorrectionInput.NewAssessmentInput] = []
+        existing_names = {a.name.strip().lower() for a in course.assessments}
+        for name, raw_date in inp.manual_exam_dates.items():
+            try:
+                from dateutil import parser as dp
+                d = dp.parse(raw_date).date()
+            except Exception:
+                warnings.append(f"Could not parse date '{raw_date}' for '{name}'; skipped.")
+                continue
+            if name.strip().lower() in existing_names:
+                parsed_overrides[name] = d
+            else:
+                new_assessments.append(
+                    CourseCorrectionInput.NewAssessmentInput(name=name, type=AssessmentType.exam, scheduled_date=d)
+                )
+        corr_out = apply_course_corrections(CourseCorrectionInput(
+            course=course,
+            assessment_date_overrides=parsed_overrides,
+            add_assessments=new_assessments,
+        ))
+        warnings.extend(corr_out.warnings)
+        course = corr_out.course
+
+    # 4) Weight topics
+    weight_out = weight_topics(WeightTopicsInput(course=course, boost_keywords=inp.boost_keywords))
+    course = weight_out.course
+
+    # 5) Generate plan
+    prefs = StudyPreferences(
+        course_start_date=inp.course_start_date,
+        timezone=inp.timezone,
+        hours_per_day=inp.hours_per_day,
+        days_off=inp.days_off,
+    )
+    plan_out = generate_study_plan(GenerateStudyPlanInput(course=course, preferences=prefs))
+    warnings.extend(plan_out.warnings)
+    plan = plan_out.plan
+    plan.meta["generated_at"] = datetime.now(timezone.utc).isoformat()
+
+    # 6) Build report
+    report_out = build_plan_report(BuildPlanReportInput(course=course, plan=plan, include_markdown=True))
+
+    # 7) Export
+    export_out = export_plan(ExportPlanInput(plan=plan, format=inp.export_format, target={}))
+    warnings.extend(export_out.warnings)
+
+    return FullPipelineOutput(
+        course_title=course.course_title,
+        topics_found=len(course.topics),
+        assessments_found=len(course.assessments),
+        sessions_total=len(plan.sessions),
+        plan_start=plan.start_date.isoformat(),
+        plan_end=plan.end_date.isoformat(),
+        report=report_out.report,
+        export_format=export_out.format,
+        export_data=export_out.result,
+        warnings=warnings,
+    )
 
 
 def main() -> None:
