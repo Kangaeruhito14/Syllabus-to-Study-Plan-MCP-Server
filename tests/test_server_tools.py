@@ -8,6 +8,7 @@ from syllabus_mcp.server import (
     ExportPlanInput,
     FullPipelineInput,
     GenerateStudyPlanInput,
+    GetRawTextInput,
     ParseSyllabusInput,
     WeightTopicsInput,
     apply_course_corrections,
@@ -16,6 +17,7 @@ from syllabus_mcp.server import (
     export_plan,
     full_pipeline,
     generate_study_plan,
+    get_raw_text,
     parse_syllabus,
     weight_topics,
 )
@@ -210,6 +212,45 @@ def test_export_plan_notion_missing_creds_returns_warning():
 
 
 # ── full_pipeline ──────────────────────────────────────────────────────────────
+
+# ── get_raw_text ───────────────────────────────────────────────────────────────
+
+def test_get_raw_text_returns_content():
+    out = get_raw_text(GetRawTextInput(content_type="text", content=_SIMPLE_TEXT))
+    assert len(out.raw_text) > 0
+    assert out.char_count > 0
+    assert out.is_likely_syllabus is True
+    assert out.syllabus_confidence >= 0.4
+
+
+def test_get_raw_text_detects_non_syllabus():
+    recipe = "Chicken Tikka Masala. Ingredients: chicken, yogurt, spices. Cook and serve."
+    out = get_raw_text(GetRawTextInput(content_type="text", content=recipe))
+    assert out.is_likely_syllabus is False
+    assert len(out.warnings) > 0
+
+
+def test_parse_syllabus_warns_on_non_syllabus():
+    recipe = "Chicken Tikka Masala. Ingredients: chicken, yogurt, spices. Cook and serve."
+    out = parse_syllabus(ParseSyllabusInput(content_type="text", content=recipe, timezone="UTC"))
+    assert any("not appear to be a syllabus" in w or "WARNING" in w for w in out.warnings)
+
+
+def test_parse_syllabus_table_format():
+    table_syllabus = (
+        "CSCI 3400 - Database Management Systems\n"
+        "COURSE SCHEDULE:\n"
+        "Jan 13   Introduction to Databases   Ch. 1\n"
+        "Jan 20   Relational Model   Ch. 2\n"
+        "Feb 17   MIDTERM EXAM\n"
+        "Apr 21   FINAL EXAM\n"
+    )
+    out = parse_syllabus(ParseSyllabusInput(content_type="text", content=table_syllabus, timezone="UTC"))
+    assert "3400" in (out.course.course_title or "") or "Database" in (out.course.course_title or "")
+    assert len(out.course.topics) >= 2
+    dated_exams = [a for a in out.course.assessments if a.scheduled_date]
+    assert len(dated_exams) >= 1
+
 
 def test_full_pipeline_text_produces_plan():
     out = full_pipeline(FullPipelineInput(

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from syllabus_mcp.models import Assessment, AssessmentType, Confidence, CourseModel, StudyPlan, StudyPreferences, Topic
 from syllabus_mcp.ocr import pdf_bytes_to_text_pages
-from syllabus_mcp.extract import TextPage, extract_course_model_from_pages, extract_text_from_pdf_bytes
+from syllabus_mcp.extract import TextPage, extract_course_model_from_pages, extract_text_from_pdf_bytes, is_likely_syllabus
 from syllabus_mcp.planner import generate_plan, weight_topics as weight_course_topics
 from syllabus_mcp.exporters import plan_to_ics, push_plan_to_notion
 from syllabus_mcp.gcal import push_plan_to_google_calendar
@@ -114,12 +114,28 @@ class BuildPlanReportOutput(BaseModel):
     report: str
 
 
+class GetRawTextInput(BaseModel):
+    content_type: Literal["pdf_base64", "text"]
+    content: str = Field(description="Base64 PDF bytes or plain text.")
+
+
+class GetRawTextOutput(BaseModel):
+    raw_text: str
+    page_count: int
+    char_count: int
+    is_likely_syllabus: bool
+    syllabus_confidence: float
+    warnings: list[str] = Field(default_factory=list)
+
+
 mcp = FastMCP(
     name="Syllabus-to-Study-Plan",
     instructions=(
         "Tools to parse a syllabus (PDF/text), detect exams, weight topics, "
         "generate a spaced-repetition study schedule, and export/push to ICS, "
-        "Google Calendar, or Notion."
+        "Google Calendar, or Notion. "
+        "Use get_raw_text first when parse_syllabus produces low-quality results — "
+        "read the raw text yourself and call apply_course_corrections to fix extraction."
     ),
 )
 
@@ -128,39 +144,121 @@ def _decode_pdf_base64(b64: str) -> bytes:
     return base64.b64decode(b64.encode("utf-8"))
 
 
-@mcp.tool
-def parse_syllabus(inp: ParseSyllabusInput) -> ParseSyllabusOutput:
-    """
-    Parse a syllabus provided as base64 PDF bytes (scanned/text) or as plain text.
+def _pdf_bytes_to_pages(pdf_bytes: bytes) -> tuple[list[TextPage], list[str]]:
+    """Extract pages from PDF bytes; OCR fallback if text is sparse. Returns (pages, warnings)."""
+    warnings: list[str] = []
+    pages = extract_text_from_pdf_bytes(pdf_bytes)
+    total_chars = sum(len(p.text.strip()) for p in pages)
+    if total_chars < 300:
+        warnings.append("PDF text extraction sparse; using OCR fallback.")
+        ocr_pages = pdf_bytes_to_text_pages(pdf_bytes)
+        pages = [TextPage(page_number=p.page_number, text=p.text) for p in ocr_pages]
+    return pages, warnings
 
-    Returns a normalized CourseModel with topics and assessments, including confidence fields.
+
+@mcp.tool
+def get_raw_text(inp: GetRawTextInput) -> GetRawTextOutput:
+    """
+    Extract and return the full raw text from a PDF or text input, with no parsing.
+
+    Use this when parse_syllabus produces wrong or incomplete results.
+    Read the returned raw_text yourself to identify the real course title, topics,
+    and exam dates, then call apply_course_corrections to fix the CourseModel.
+
+    Also tells you whether the input looks like a syllabus.
     """
     warnings: list[str] = []
 
     if inp.content_type == "pdf_base64":
         pdf_bytes = _decode_pdf_base64(inp.content)
-        # Try native text extraction first; if it's empty/too sparse, fall back to OCR.
-        pages = extract_text_from_pdf_bytes(pdf_bytes)
-        total_chars = sum(len(p.text.strip()) for p in pages)
-        if total_chars < 300:
-            warnings.append("PDF text extraction sparse; using OCR fallback.")
-            ocr_pages = pdf_bytes_to_text_pages(pdf_bytes)
-            pages = [TextPage(page_number=p.page_number, text=p.text) for p in ocr_pages]
-        course = extract_course_model_from_pages(pages, timezone=inp.timezone)
-        if not course.topics:
-            warnings.append("No topics detected; provide topic list manually or ensure syllabus has weekly outline.")
-        if not course.assessments:
-            warnings.append("No assessments detected; you may need to provide exam dates manually.")
-        if any("Week-based schedule detected" in c for c in course.constraints_found):
-            warnings.append("Syllabus appears week-based without concrete dates; use apply_course_corrections.assessment_date_overrides.")
+        pages, w = _pdf_bytes_to_pages(pdf_bytes)
+        warnings.extend(w)
+        raw_text = "\n\n--- PAGE BREAK ---\n\n".join(p.text for p in pages)
+        page_count = len(pages)
     else:
-        text = inp.content.strip()
-        pages = [TextPage(page_number=1, text=text)]
-        course = extract_course_model_from_pages(pages, timezone=inp.timezone)
-        if not course.topics:
-            warnings.append("No topics detected from text; consider pasting the weekly schedule section.")
-        if any("Week-based schedule detected" in c for c in course.constraints_found):
-            warnings.append("Syllabus appears week-based without concrete dates; use apply_course_corrections.assessment_date_overrides.")
+        raw_text = inp.content.strip()
+        page_count = 1
+
+    likely, confidence = is_likely_syllabus(raw_text)
+    if not likely:
+        warnings.append(
+            f"This document does not appear to be a syllabus "
+            f"(confidence={confidence:.0%}). Results may be meaningless."
+        )
+
+    return GetRawTextOutput(
+        raw_text=raw_text,
+        page_count=page_count,
+        char_count=len(raw_text),
+        is_likely_syllabus=likely,
+        syllabus_confidence=round(confidence, 2),
+        warnings=warnings,
+    )
+
+
+@mcp.tool
+def parse_syllabus(inp: ParseSyllabusInput) -> ParseSyllabusOutput:
+    """
+    Parse a syllabus (PDF or text) into a structured CourseModel.
+
+    The extractor handles four common syllabus formats:
+    - Week/Module prefix  (Week 1: Introduction, Module 2: ...)
+    - Date-column table   (Jan 13   Introduction to Databases   Ch.1)
+    - Course Objectives   (bullet/numbered learning outcomes section)
+    - Numbered schedule   (1. Variables  2. Loops ...)
+
+    If topics or exam dates are missing/wrong after parsing, call get_raw_text
+    to read the full PDF text yourself, then fix with apply_course_corrections.
+    """
+    warnings: list[str] = []
+
+    if inp.content_type == "pdf_base64":
+        pdf_bytes = _decode_pdf_base64(inp.content)
+        pages, w = _pdf_bytes_to_pages(pdf_bytes)
+        warnings.extend(w)
+    else:
+        pages = [TextPage(page_number=1, text=inp.content.strip())]
+
+    # Non-syllabus detection
+    full_text = "\n".join(p.text for p in pages)
+    likely_syl, syl_confidence = is_likely_syllabus(full_text)
+    if not likely_syl:
+        warnings.append(
+            f"WARNING: This document does not appear to be a syllabus "
+            f"(confidence={syl_confidence:.0%}). "
+            "Use get_raw_text to inspect the content and verify."
+        )
+
+    course = extract_course_model_from_pages(pages, timezone=inp.timezone)
+
+    # Quality warnings
+    if not course.topics:
+        warnings.append(
+            "No topics detected. Call get_raw_text to read the full PDF text, "
+            "then use apply_course_corrections.add_topics."
+        )
+    elif len(course.topics) < 3:
+        warnings.append(
+            f"Only {len(course.topics)} topic(s) detected — likely incomplete. "
+            "Call get_raw_text to verify and fix with apply_course_corrections."
+        )
+
+    if not course.assessments:
+        warnings.append(
+            "No assessments detected. Use apply_course_corrections.add_assessments "
+            "to add exam names and dates manually."
+        )
+
+    if any("Week-based" in c for c in course.constraints_found):
+        warnings.append(
+            "Week-based syllabus: no calendar dates found. "
+            "Provide exam dates via apply_course_corrections or full_pipeline.manual_exam_dates."
+        )
+
+    exam_without_dates = [a for a in course.assessments if a.type == AssessmentType.exam and not a.scheduled_date]
+    if exam_without_dates:
+        names = ", ".join(a.name for a in exam_without_dates[:3])
+        warnings.append(f"Exams detected without dates: {names}. Add dates via apply_course_corrections.")
 
     return ParseSyllabusOutput(course=course, warnings=warnings)
 
@@ -619,6 +717,14 @@ class FullPipelineOutput(BaseModel):
     export_format: str
     export_data: Any
     warnings: list[str] = Field(default_factory=list)
+    is_syllabus: bool = True
+    raw_text_preview: str = Field(
+        default="",
+        description=(
+            "First 1500 chars of extracted PDF text. "
+            "If topics/title look wrong, read this and call apply_course_corrections to fix."
+        ),
+    )
 
 
 @mcp.tool
@@ -631,6 +737,9 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
 
     Use manual_exam_dates to provide real dates when the syllabus is week-based
     (no explicit calendar dates). Example: {"Final Exam": "2026-09-10"}.
+
+    If topics or title look wrong in the output, check raw_text_preview and then
+    call apply_course_corrections followed by weight_topics / generate_study_plan.
     """
     warnings: list[str] = []
 
@@ -641,6 +750,15 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
         timezone=inp.timezone,
     ))
     warnings.extend(parse_out.warnings)
+
+    # Non-syllabus early signal
+    raw_text = parse_out.course.extracted_text_summary or ""
+    is_syl, syl_conf = is_likely_syllabus(raw_text)
+    if not is_syl:
+        warnings.append(
+            f"This document may not be a syllabus (confidence={syl_conf:.0%}). "
+            "Check raw_text_preview to verify."
+        )
 
     # 2) Detect exam dates
     detect_out = detect_exam_dates(parse_out.course)
@@ -707,6 +825,8 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
         export_format=export_out.format,
         export_data=export_out.result,
         warnings=warnings,
+        is_syllabus=is_syl,
+        raw_text_preview=(course.extracted_text_summary or "")[:1500],
     )
 
 
