@@ -623,37 +623,46 @@ def setup_notion_database(inp: SetupNotionDatabaseInput) -> SetupNotionDatabaseO
 
     Run this once, then use the returned database_id in export_plan or full_pipeline.
     """
-    from notion_client import Client as NotionClient
+    import requests as _req
 
-    client = NotionClient(auth=inp.notion_token)
-    warnings: list[str] = []
-
-    properties: dict[str, Any] = {
-        "Name": {"title": {}},
-        "Date": {"date": {}},
-        "Type": {
-            "select": {
-                "options": [
-                    {"name": "learn", "color": "blue"},
-                    {"name": "review", "color": "green"},
-                    {"name": "practice", "color": "yellow"},
-                    {"name": "mock_exam", "color": "red"},
-                    {"name": "buffer", "color": "gray"},
-                ]
-            }
+    headers = {
+        "Authorization": f"Bearer {inp.notion_token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "parent": {"type": "page_id", "page_id": inp.parent_page_id},
+        "title": [{"type": "text", "text": {"content": inp.database_title}}],
+        "properties": {
+            "Name": {"title": {}},
+            "Date": {"date": {}},
+            "Type": {
+                "select": {
+                    "options": [
+                        {"name": "learn", "color": "blue"},
+                        {"name": "review", "color": "green"},
+                        {"name": "practice", "color": "yellow"},
+                        {"name": "mock_exam", "color": "red"},
+                        {"name": "buffer", "color": "gray"},
+                    ]
+                }
+            },
+            "Minutes": {"number": {"format": "number"}},
+            "Key": {"rich_text": {}},
+            "PlanKey": {"rich_text": {}},
+            "Rationale": {"rich_text": {}},
         },
-        "Minutes": {"number": {"format": "number"}},
-        "Key": {"rich_text": {}},
-        "PlanKey": {"rich_text": {}},
-        "Rationale": {"rich_text": {}},
     }
 
     try:
-        db = client.databases.create(
-            parent={"type": "page_id", "page_id": inp.parent_page_id},
-            title=[{"type": "text", "text": {"content": inp.database_title}}],
-            properties=properties,
+        resp = _req.post(
+            "https://api.notion.com/v1/databases",
+            headers=headers,
+            json=payload,
+            timeout=30,
         )
+        resp.raise_for_status()
+        db = resp.json()
         db_id = db["id"]
         db_url = db.get("url", f"https://notion.so/{db_id.replace('-', '')}")
         return SetupNotionDatabaseOutput(
@@ -663,7 +672,7 @@ def setup_notion_database(inp: SetupNotionDatabaseInput) -> SetupNotionDatabaseO
                 f"Database '{inp.database_title}' created successfully. "
                 f"Use database_id='{db_id}' in export_plan or full_pipeline."
             ),
-            warnings=warnings,
+            warnings=[],
         )
     except Exception as exc:
         return SetupNotionDatabaseOutput(

@@ -5,13 +5,65 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from notion_client import Client as NotionClient
+import requests as _requests
 
 from syllabus_mcp.models import StudyPlan, StudySession
 
+_NOTION_VERSION = "2022-06-28"
+_NOTION_BASE = "https://api.notion.com/v1"
+
+
+def _notion_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": _NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _notion_query_db(token: str, database_id: str, body: dict) -> dict:
+    resp = _requests.post(
+        f"{_NOTION_BASE}/databases/{database_id}/query",
+        headers=_notion_headers(token),
+        json=body,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _notion_create_page(token: str, payload: dict) -> dict:
+    resp = _requests.post(
+        f"{_NOTION_BASE}/pages",
+        headers=_notion_headers(token),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _notion_update_page(token: str, page_id: str, properties: dict) -> dict:
+    resp = _requests.patch(
+        f"{_NOTION_BASE}/pages/{page_id}",
+        headers=_notion_headers(token),
+        json={"properties": properties},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _notion_archive_page(token: str, page_id: str) -> None:
+    _requests.patch(
+        f"{_NOTION_BASE}/pages/{page_id}",
+        headers=_notion_headers(token),
+        json={"archived": True},
+        timeout=30,
+    )
+
 
 def _ics_escape(text: str) -> str:
-    # RFC5545 escaping for TEXT values
     return (
         text.replace("\\", "\\\\")
         .replace(";", "\\;")
@@ -22,24 +74,17 @@ def _ics_escape(text: str) -> str:
 
 
 def _ics_dt(dt: datetime) -> str:
-    # UTC timestamp in basic format
     dt_utc = dt.astimezone(timezone.utc)
     return dt_utc.strftime("%Y%m%dT%H%M%SZ")
 
 
 def _ics_uid(plan: StudyPlan, s: StudySession) -> str:
     base = _stable_key(plan, s)
-    # keep UID safe-ish
     safe = re.sub(r"[^a-zA-Z0-9._:-]+", "-", base)[:160]
     return f"{safe}@syllabus-mcp"
 
 
 def plan_to_ics(plan: StudyPlan) -> str:
-    """
-    Generate an RFC5545-ish ICS calendar without external dependencies.
-
-    We emit UTC timestamps. Events are placed at 12:00 local-ish to avoid DST edge cases.
-    """
     now = datetime.now(timezone.utc)
     lines: list[str] = [
         "BEGIN:VCALENDAR",
@@ -99,19 +144,6 @@ def push_plan_to_notion(
     database_id: str,
     prune_stale: bool = True,
 ) -> NotionPushResult:
-    """
-    Idempotent-ish Notion push using a stable key stored in a 'Key' property.
-
-    Expected Notion DB properties (create this template in docs):
-    - Name (title)
-    - Date (date)
-    - Type (select)
-    - Minutes (number)
-    - Key (rich_text)
-    - Rationale (rich_text) [optional]
-    """
-    client = NotionClient(auth=notion_token)
-
     created = 0
     updated = 0
     page_ids: list[str] = []
@@ -123,15 +155,12 @@ def push_plan_to_notion(
         key = _stable_key(plan, s)
         active_keys.add(key)
 
-        # Query existing by Key
-        existing = client.databases.query(
-            database_id=database_id,
-            filter={
-                "property": "Key",
-                "rich_text": {"equals": key},
-            },
-            page_size=1,
+        existing = _notion_query_db(
+            notion_token,
+            database_id,
+            {"filter": {"property": "Key", "rich_text": {"equals": key}}, "page_size": 1},
         )
+
         props: dict[str, Any] = {
             "Name": {"title": [{"text": {"content": f"[{s.session_type.value}] {s.topic_title}"}}]},
             "Date": {"date": {"start": s.session_date.isoformat()}},
@@ -147,54 +176,49 @@ def push_plan_to_notion(
         if existing.get("results"):
             page_id = existing["results"][0]["id"]
             try:
-                client.pages.update(page_id=page_id, properties=props)
+                _notion_update_page(notion_token, page_id, props)
             except Exception:
-                # Backward compatible with DBs that don't yet have PlanKey property.
                 supports_plan_key = False
                 props.pop("PlanKey", None)
-                client.pages.update(page_id=page_id, properties=props)
+                _notion_update_page(notion_token, page_id, props)
             updated += 1
             page_ids.append(page_id)
         else:
+            payload: dict[str, Any] = {
+                "parent": {"database_id": database_id},
+                "properties": props,
+            }
             try:
-                page = client.pages.create(
-                    parent={"database_id": database_id},
-                    properties=props,
-                )
+                page = _notion_create_page(notion_token, payload)
             except Exception:
                 supports_plan_key = False
                 props.pop("PlanKey", None)
-                page = client.pages.create(
-                    parent={"database_id": database_id},
-                    properties=props,
-                )
+                payload["properties"] = props
+                page = _notion_create_page(notion_token, payload)
             created += 1
             page_ids.append(page["id"])
 
     if prune_stale and supports_plan_key:
-        # Best effort: archive pages from the same plan key that are no longer present.
         cursor: str | None = None
         while True:
-            page = client.databases.query(
-                database_id=database_id,
-                filter={"property": "PlanKey", "rich_text": {"equals": plan_key}},
-                start_cursor=cursor,
-                page_size=100,
-            )
-            results = page.get("results", [])
-            for item in results:
-                props = item.get("properties", {})
-                key_prop = props.get("Key", {})
-                key_text = ""
-                if key_prop.get("rich_text"):
-                    key_text = "".join([x.get("plain_text", "") for x in key_prop["rich_text"]]).strip()
+            body: dict[str, Any] = {
+                "filter": {"property": "PlanKey", "rich_text": {"equals": plan_key}},
+                "page_size": 100,
+            }
+            if cursor:
+                body["start_cursor"] = cursor
+            page_resp = _notion_query_db(notion_token, database_id, body)
+            for item in page_resp.get("results", []):
+                key_prop = item.get("properties", {}).get("Key", {})
+                key_text = "".join(
+                    x.get("plain_text", "") for x in key_prop.get("rich_text", [])
+                ).strip()
                 if key_text and key_text not in active_keys:
-                    client.pages.update(page_id=item["id"], archived=True)
-            cursor = page.get("next_cursor")
-            if not page.get("has_more"):
+                    _notion_archive_page(notion_token, item["id"])
+            cursor = page_resp.get("next_cursor")
+            if not page_resp.get("has_more"):
                 break
 
     return NotionPushResult(
         created=created, updated=updated, database_id=database_id, page_ids=page_ids
     )
-
