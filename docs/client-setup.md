@@ -39,10 +39,20 @@ Config file already included at `.cursor/mcp.json`.
 
 Config file at `.vscode/mcp.json` is already included.
 
+```json
+{
+  "mcpServers": {
+    "syllabus-to-study-plan": {
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-m", "syllabus_mcp.server"]
+    }
+  }
+}
+```
+
 1. Open this folder in VS Code
-2. If using GitHub Copilot with MCP support: it auto-detects `.vscode/mcp.json`
-3. If using Claude VS Code extension: same config is picked up automatically
-4. Check your extension's MCP settings to confirm the server appears
+2. The extension auto-detects `.vscode/mcp.json` — no extra configuration needed
+3. Check your extension's MCP panel to confirm `syllabus-to-study-plan` appears
 
 ---
 
