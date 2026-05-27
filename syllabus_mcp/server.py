@@ -16,10 +16,14 @@ from syllabus_mcp.gcal import push_plan_to_google_calendar
 
 
 class ParseSyllabusInput(BaseModel):
-    content_type: Literal["pdf_base64", "text"] = Field(
-        description="Provide either base64-encoded PDF bytes or plain text."
+    content_type: Literal["pdf_base64", "text", "docx_base64", "html", "url"] = Field(
+        description=(
+            "Input type: 'pdf_base64' (base64-encoded PDF), 'text' (plain text), "
+            "'docx_base64' (base64-encoded .docx), 'html' (raw HTML string), "
+            "'url' (web URL to fetch and parse)."
+        )
     )
-    content: str = Field(description="Base64 PDF bytes or syllabus text.")
+    content: str = Field(description="The content — PDF/DOCX bytes as base64, plain text, raw HTML, or a URL.")
     timezone: str | None = Field(default=None, description="Optional timezone hint.")
 
 
@@ -115,8 +119,8 @@ class BuildPlanReportOutput(BaseModel):
 
 
 class GetRawTextInput(BaseModel):
-    content_type: Literal["pdf_base64", "text"]
-    content: str = Field(description="Base64 PDF bytes or plain text.")
+    content_type: Literal["pdf_base64", "text", "docx_base64", "html", "url"]
+    content: str = Field(description="Base64 PDF/DOCX bytes, plain text, raw HTML, or a URL.")
 
 
 class GetRawTextOutput(BaseModel):
@@ -144,14 +148,108 @@ def _decode_pdf_base64(b64: str) -> bytes:
     return base64.b64decode(b64.encode("utf-8"))
 
 
+def _meaningful_chars(pages: list[TextPage]) -> int:
+    """Count chars after removing scanner watermark lines and blank lines."""
+    _WATERMARKS = {"scanned with", "camscanner", "created with", "adobe scan"}
+    total = 0
+    for p in pages:
+        for line in p.text.split("\n"):
+            stripped = line.strip()
+            low = stripped.lower()
+            if not stripped or any(w in low for w in _WATERMARKS):
+                continue
+            total += len(stripped)
+    return total
+
+
+def _html_to_text(html: str) -> str:
+    """Strip HTML tags and return clean plain text."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+
+
+def _docx_bytes_to_text(docx_bytes: bytes) -> str:
+    """Extract plain text from a .docx file."""
+    import io as _io
+    from docx import Document
+    doc = Document(_io.BytesIO(docx_bytes))
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    # Also extract table cells
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    paragraphs.append(cell.text.strip())
+    return "\n".join(paragraphs)
+
+
+def _fetch_url_text(url: str) -> tuple[str, list[str]]:
+    """Fetch a URL and return (plain_text, warnings)."""
+    import requests as _req
+    warnings: list[str] = []
+    try:
+        resp = _req.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (SyllabusBot/1.0)"})
+        resp.raise_for_status()
+        ctype = resp.headers.get("content-type", "")
+        if "pdf" in ctype:
+            warnings.append("URL returned a PDF — use content_type='pdf_base64' with the downloaded file instead.")
+            return "", warnings
+        text = _html_to_text(resp.text)
+        if not text.strip():
+            warnings.append(f"URL returned empty content. Status: {resp.status_code}")
+        return text, warnings
+    except Exception as exc:
+        warnings.append(f"Failed to fetch URL: {exc}")
+        return "", warnings
+
+
+def _content_to_pages(content_type: str, content: str) -> tuple[list[TextPage], list[str]]:
+    """
+    Convert any supported content_type into a list of TextPage objects.
+    Handles: pdf_base64, text, docx_base64, html, url.
+    """
+    warnings: list[str] = []
+
+    if content_type == "pdf_base64":
+        pdf_bytes = _decode_pdf_base64(content)
+        pages, w = _pdf_bytes_to_pages(pdf_bytes)
+        warnings.extend(w)
+        return pages, warnings
+
+    if content_type == "docx_base64":
+        try:
+            docx_bytes = base64.b64decode(content)
+            text = _docx_bytes_to_text(docx_bytes)
+            return [TextPage(page_number=1, text=text)], warnings
+        except Exception as exc:
+            warnings.append(f"Failed to read DOCX: {exc}")
+            return [TextPage(page_number=1, text="")], warnings
+
+    if content_type == "html":
+        text = _html_to_text(content)
+        return [TextPage(page_number=1, text=text)], warnings
+
+    if content_type == "url":
+        text, w = _fetch_url_text(content)
+        warnings.extend(w)
+        return [TextPage(page_number=1, text=text)], warnings
+
+    # default: plain text
+    return [TextPage(page_number=1, text=content.strip())], warnings
+
+
 def _pdf_bytes_to_pages(pdf_bytes: bytes) -> tuple[list[TextPage], list[str]]:
     """Extract pages from PDF bytes; OCR fallback if text is sparse. Returns (pages, warnings)."""
     warnings: list[str] = []
     pages = extract_text_from_pdf_bytes(pdf_bytes)
-    total_chars = sum(len(p.text.strip()) for p in pages)
-    if total_chars < 300:
+    if _meaningful_chars(pages) < 300:
         warnings.append("PDF text extraction sparse; using OCR fallback.")
-        ocr_pages = pdf_bytes_to_text_pages(pdf_bytes)
+        ocr_pages = pdf_bytes_to_text_pages(pdf_bytes, max_pages=20)
+        if len(pages) > 20:
+            warnings.append("PDF has more than 20 pages; OCR capped at page 20 to avoid memory issues.")
         pages = [TextPage(page_number=p.page_number, text=p.text) for p in ocr_pages]
     return pages, warnings
 
@@ -168,16 +266,10 @@ def get_raw_text(inp: GetRawTextInput) -> GetRawTextOutput:
     Also tells you whether the input looks like a syllabus.
     """
     warnings: list[str] = []
-
-    if inp.content_type == "pdf_base64":
-        pdf_bytes = _decode_pdf_base64(inp.content)
-        pages, w = _pdf_bytes_to_pages(pdf_bytes)
-        warnings.extend(w)
-        raw_text = "\n\n--- PAGE BREAK ---\n\n".join(p.text for p in pages)
-        page_count = len(pages)
-    else:
-        raw_text = inp.content.strip()
-        page_count = 1
+    pages, w = _content_to_pages(inp.content_type, inp.content)
+    warnings.extend(w)
+    raw_text = "\n\n--- PAGE BREAK ---\n\n".join(p.text for p in pages)
+    page_count = len(pages)
 
     likely, confidence = is_likely_syllabus(raw_text)
     if not likely:
@@ -211,13 +303,8 @@ def parse_syllabus(inp: ParseSyllabusInput) -> ParseSyllabusOutput:
     to read the full PDF text yourself, then fix with apply_course_corrections.
     """
     warnings: list[str] = []
-
-    if inp.content_type == "pdf_base64":
-        pdf_bytes = _decode_pdf_base64(inp.content)
-        pages, w = _pdf_bytes_to_pages(pdf_bytes)
-        warnings.extend(w)
-    else:
-        pages = [TextPage(page_number=1, text=inp.content.strip())]
+    pages, w = _content_to_pages(inp.content_type, inp.content)
+    warnings.extend(w)
 
     # Non-syllabus detection
     full_text = "\n".join(p.text for p in pages)
@@ -684,10 +771,12 @@ def setup_notion_database(inp: SetupNotionDatabaseInput) -> SetupNotionDatabaseO
 
 
 class FullPipelineInput(BaseModel):
-    content_type: Literal["pdf_base64", "text"] = Field(
-        description="Provide either base64-encoded PDF bytes or plain text."
+    content_type: Literal["pdf_base64", "text", "docx_base64", "html", "url"] = Field(
+        description=(
+            "Input type: 'pdf_base64', 'text', 'docx_base64', 'html', or 'url'."
+        )
     )
-    content: str = Field(description="Base64 PDF bytes or syllabus text.")
+    content: str = Field(description="Base64 PDF/DOCX bytes, plain text, raw HTML, or a URL.")
     timezone: str = Field(default="UTC", description="Your timezone, e.g. 'Asia/Kolkata'.")
     hours_per_day: float = Field(default=1.5, description="Study hours available per day.")
     days_off: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(
