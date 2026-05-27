@@ -37,20 +37,21 @@ def _event_id(plan: StudyPlan, s: StudySession) -> str:
     return f"stp{h}"
 
 
-def _build_event(s: StudySession, timezone: str) -> dict[str, Any]:
-    # Use timed events to represent study blocks
-    start_dt = datetime.combine(s.session_date, datetime.min.time()).replace(hour=12)
-    minutes = int(s.estimated_minutes)
-    end_dt = start_dt + timedelta(minutes=minutes)
+def _build_event(s: StudySession, start_dt: datetime, timezone: str) -> dict[str, Any]:
+    end_dt = start_dt + timedelta(minutes=int(s.estimated_minutes))
     return {
         "summary": f"[{s.session_type.value}] {s.topic_title}",
         "description": "\n".join(s.rationale) if s.rationale else None,
         "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
-        "end": {
-            "dateTime": end_dt.isoformat(),
-            "timeZone": timezone,
-        },
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
     }
+
+
+# Priority order within a day: review first → prep → learn → practice → buffer → tutorial
+_SESSION_DAY_ORDER: dict[str, int] = {
+    "review": 0, "tutorial_prep": 1, "learn": 2,
+    "practice": 3, "buffer": 4, "mock_exam": 5, "tutorial": 6,
+}
 
 
 def push_plan_to_google_calendar(
@@ -62,17 +63,25 @@ def push_plan_to_google_calendar(
     client_id: str | None = None,
     client_secret: str | None = None,
     calendar_id: str = "primary",
+    study_start_hour: int = 20,
+    session_gap_minutes: int = 5,
     prune_stale: bool = True,
 ) -> GoogleCalendarPushResult:
     """
     Push plan sessions to Google Calendar using OAuth credentials.
 
-    Idempotency is achieved via deterministic event IDs.
+    Idempotency: deterministic event IDs — re-running updates existing events
+    and deletes stale ones. Safe to call whenever the plan changes.
 
-    MVP auth model:
-    - caller provides access_token (and optionally refresh_token+client_id+client_secret)
-    - server does not run an interactive OAuth browser flow (keeps MCP tool non-interactive)
+    Multiple sessions on the same day are stacked in order:
+    review → tutorial_prep → learn → practice, starting at study_start_hour
+    (default 20 = 8 PM) with session_gap_minutes between them.
+
+    Re-calling with updated parameters will automatically update all events
+    and remove any that no longer exist in the new plan.
     """
+    from collections import defaultdict as _dd
+
     creds = Credentials(
         token=access_token,
         refresh_token=refresh_token,
@@ -88,27 +97,52 @@ def push_plan_to_google_calendar(
     deleted = 0
     event_ids: list[str] = []
     plan_key = _plan_key(plan)
+    tz = plan.timezone or "UTC"
 
+    # Group sessions by date, sort within each day by priority
+    sessions_by_date: dict = _dd(list)
     for s in plan.sessions:
-        eid = _event_id(plan, s)
-        body = _build_event(s, plan.timezone)
-        body["id"] = eid
-        body["extendedProperties"] = {
-            "private": {
-                "syllabus_plan_key": plan_key,
-                "syllabus_session_key": _session_key(s),
+        sessions_by_date[s.session_date].append(s)
+
+    for day_date in sorted(sessions_by_date.keys()):
+        day_sessions = sorted(
+            sessions_by_date[day_date],
+            key=lambda s: _SESSION_DAY_ORDER.get(s.session_type.value, 9),
+        )
+
+        # First session starts at study_start_hour; subsequent ones follow immediately
+        current_hour = study_start_hour
+        current_minute = 0
+
+        for s in day_sessions:
+            start_dt = datetime.combine(
+                day_date, datetime.min.time()
+            ).replace(hour=current_hour, minute=current_minute)
+
+            eid = _event_id(plan, s)
+            body = _build_event(s, start_dt, tz)
+            body["id"] = eid
+            body["extendedProperties"] = {
+                "private": {
+                    "syllabus_plan_key": plan_key,
+                    "syllabus_session_key": _session_key(s),
+                }
             }
-        }
 
-        try:
-            service.events().get(calendarId=calendar_id, eventId=eid).execute()
-            service.events().update(calendarId=calendar_id, eventId=eid, body=body).execute()
-            updated += 1
-        except Exception:
-            service.events().insert(calendarId=calendar_id, body=body).execute()
-            created += 1
+            try:
+                service.events().get(calendarId=calendar_id, eventId=eid).execute()
+                service.events().update(calendarId=calendar_id, eventId=eid, body=body).execute()
+                updated += 1
+            except Exception:
+                service.events().insert(calendarId=calendar_id, body=body).execute()
+                created += 1
 
-        event_ids.append(eid)
+            event_ids.append(eid)
+
+            # Advance clock: end of this session + gap
+            total_mins = current_minute + s.estimated_minutes + session_gap_minutes
+            current_hour += total_mins // 60
+            current_minute = total_mins % 60
 
     if prune_stale:
         seen = set(event_ids)
