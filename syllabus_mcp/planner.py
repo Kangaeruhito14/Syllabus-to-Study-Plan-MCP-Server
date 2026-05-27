@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import Any
 
 from syllabus_mcp.models import CourseModel, SessionType, StudyPlan, StudyPreferences, StudySession, Topic
 
@@ -200,6 +201,175 @@ def generate_plan(course: CourseModel, preferences: StudyPreferences) -> StudyPl
             "buffer_every": buffer_every,
             "topics_count": len(course.topics),
             "assessments_count": len(course.assessments),
+        },
+    )
+
+
+def generate_coverage_plan(
+    course: CourseModel,
+    preferences: StudyPreferences,
+    *,
+    study_end_date: date,
+    tutorial_dates: list[dict[str, Any]] | None = None,
+) -> StudyPlan:
+    """
+    Coverage mode: distribute all topics sequentially across the study window.
+
+    Tutorial-aware:
+    - Tutorial days are blocked and marked as SessionType.tutorial.
+    - The N study days immediately before each tutorial are marked as
+      SessionType.tutorial_prep (review only that tutorial's topic).
+    - Remaining free days receive sequential topic assignments.
+
+    If there are more free days than topics, revision sessions fill the tail.
+    If there are more topics than free days, multiple topics are combined per day.
+    """
+    start = preferences.course_start_date or course.start_date or date.today()
+    days_off = set(preferences.days_off)
+    session_mins = preferences.session_minutes
+
+    if study_end_date <= start:
+        study_end_date = start + timedelta(days=120)
+
+    all_days = _iter_study_dates(start, study_end_date, days_off=days_off)
+    all_day_set = set(all_days)
+
+    # --- Parse and validate tutorial entries ---
+    tutorial_info: list[tuple[date, str, int]] = []  # (date, topic_hint, prep_days)
+    if tutorial_dates:
+        for td in tutorial_dates:
+            try:
+                from dateutil import parser as _dp
+                tdate = _dp.parse(str(td["date"])).date()
+                topic_hint = str(td.get("topic_hint", "Tutorial")).strip() or "Tutorial"
+                prep_days_count = max(0, int(td.get("prep_days", 3)))
+                if start <= tdate <= study_end_date:
+                    tutorial_info.append((tdate, topic_hint, prep_days_count))
+            except Exception:
+                pass  # silently skip malformed entries
+    tutorial_info.sort(key=lambda x: x[0])
+
+    # --- Mark tutorial days and prep days ---
+    tutorial_day_set: set[date] = {t[0] for t in tutorial_info}
+    # prep_assignments: date -> topic_hint (study-day only, first-come-first-served)
+    prep_assignments: dict[date, str] = {}
+
+    for tdate, topic_hint, prep_days_count in tutorial_info:
+        count = 0
+        check = tdate - timedelta(days=1)
+        while count < prep_days_count and check >= start:
+            dow = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][check.weekday()]
+            if (dow not in days_off
+                    and check in all_day_set
+                    and check not in tutorial_day_set
+                    and check not in prep_assignments):
+                prep_assignments[check] = topic_hint
+                count += 1
+            check -= timedelta(days=1)
+
+    # --- Free days = study days minus tutorial days minus prep days ---
+    blocked = tutorial_day_set | set(prep_assignments.keys())
+    free_days = [d for d in all_days if d not in blocked]
+
+    # --- Topics in curriculum order (preserve extraction/insertion order) ---
+    topics = list(course.topics)
+    n_topics = len(topics)
+    n_free = len(free_days)
+
+    # --- Assign topics to free days ---
+    regular_sessions: list[StudySession] = []
+
+    if n_free > 0 and n_topics == 0:
+        for d in free_days:
+            regular_sessions.append(StudySession(
+                session_date=d,
+                topic_title="Study / Revision",
+                session_type=SessionType.practice,
+                estimated_minutes=session_mins,
+                rationale=["coverage: no topics found in syllabus"],
+            ))
+
+    elif n_free > 0 and n_topics <= n_free:
+        # At most one topic per day; fill remaining with revision
+        for i, topic in enumerate(topics):
+            regular_sessions.append(StudySession(
+                session_date=free_days[i],
+                topic_title=topic.title,
+                session_type=SessionType.learn,
+                estimated_minutes=session_mins,
+                rationale=["coverage: 1 topic/day"],
+            ))
+        for d in free_days[n_topics:]:
+            regular_sessions.append(StudySession(
+                session_date=d,
+                topic_title="Revision / Mixed Practice",
+                session_type=SessionType.practice,
+                estimated_minutes=session_mins,
+                rationale=["coverage: all topics done — revision"],
+            ))
+
+    elif n_free > 0:
+        # More topics than free days: distribute evenly across days
+        topic_idx = 0
+        for day_idx, d in enumerate(free_days):
+            remaining_topics = n_topics - topic_idx
+            remaining_days = n_free - day_idx
+            today_count = max(1, round(remaining_topics / remaining_days))
+            day_topics = topics[topic_idx: topic_idx + today_count]
+            topic_idx += today_count
+            combined_title = " · ".join(t.title for t in day_topics)
+            regular_sessions.append(StudySession(
+                session_date=d,
+                topic_title=combined_title,
+                session_type=SessionType.learn,
+                estimated_minutes=session_mins,
+                rationale=[f"coverage: {len(day_topics)} topic(s) packed into 1 day"],
+            ))
+
+    # --- Prep day sessions ---
+    prep_sessions: list[StudySession] = [
+        StudySession(
+            session_date=prep_date,
+            topic_title=f"Tutorial Prep: {hint}",
+            session_type=SessionType.tutorial_prep,
+            estimated_minutes=session_mins,
+            rationale=[f"pre-tutorial focused review — tutorial on {hint}"],
+        )
+        for prep_date, hint in prep_assignments.items()
+    ]
+
+    # --- Tutorial day sessions ---
+    tutorial_sessions: list[StudySession] = [
+        StudySession(
+            session_date=tdate,
+            topic_title=f"Tutorial: {hint}",
+            session_type=SessionType.tutorial,
+            estimated_minutes=session_mins,
+            rationale=[f"tutorial/test day for topic: {hint}"],
+        )
+        for tdate, hint, _ in tutorial_info
+        if tdate in all_day_set
+    ]
+
+    all_sessions = regular_sessions + prep_sessions + tutorial_sessions
+    all_sessions_sorted = sorted(
+        all_sessions,
+        key=lambda s: (s.session_date, s.session_type.value, s.topic_title),
+    )
+
+    return StudyPlan(
+        course_title=course.course_title,
+        timezone=preferences.timezone,
+        start_date=start,
+        end_date=study_end_date,
+        sessions=all_sessions_sorted,
+        meta={
+            "mode": "coverage",
+            "days_off": sorted(days_off),
+            "topics_count": n_topics,
+            "free_days": n_free,
+            "tutorial_days": len(tutorial_day_set),
+            "prep_days_total": len(prep_assignments),
         },
     )
 

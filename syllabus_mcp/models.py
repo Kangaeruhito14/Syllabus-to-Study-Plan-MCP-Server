@@ -79,6 +79,8 @@ class SessionType(str, Enum):
     review = "review"
     mock_exam = "mock_exam"
     buffer = "buffer"
+    tutorial = "tutorial"            # tutorial/test day itself
+    tutorial_prep = "tutorial_prep"  # N prep days before a tutorial
 
 
 class StudySession(BaseModel):

@@ -10,8 +10,13 @@ from pydantic import BaseModel, Field
 from syllabus_mcp.models import Assessment, AssessmentType, Confidence, CourseModel, StudyPlan, StudyPreferences, Topic
 from syllabus_mcp.ocr import pdf_bytes_to_text_pages
 from syllabus_mcp.extract import TextPage, extract_course_model_from_pages, extract_text_from_pdf_bytes, is_likely_syllabus
-from syllabus_mcp.planner import generate_plan, weight_topics as weight_course_topics
-from syllabus_mcp.exporters import plan_to_ics, push_plan_to_notion
+from syllabus_mcp.planner import generate_coverage_plan, generate_plan, weight_topics as weight_course_topics
+from syllabus_mcp.exporters import (
+    DailyNotionPushResult,
+    plan_to_ics,
+    push_daily_plan_to_notion,
+    push_plan_to_notion,
+)
 from syllabus_mcp.gcal import push_plan_to_google_calendar
 
 
@@ -30,6 +35,13 @@ class ParseSyllabusInput(BaseModel):
 class ParseSyllabusOutput(BaseModel):
     course: CourseModel
     warnings: list[str] = Field(default_factory=list)
+    courses_list: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Distinct course/module names found. Non-empty for multi-course program syllabi. "
+            "Each entry is 'Module Name (N topics)' or the course code/title."
+        ),
+    )
 
 
 class DetectExamDatesOutput(BaseModel):
@@ -347,7 +359,18 @@ def parse_syllabus(inp: ParseSyllabusInput) -> ParseSyllabusOutput:
         names = ", ".join(a.name for a in exam_without_dates[:3])
         warnings.append(f"Exams detected without dates: {names}. Add dates via apply_course_corrections.")
 
-    return ParseSyllabusOutput(course=course, warnings=warnings)
+    # Build courses_list by grouping topics on their module field
+    from collections import Counter as _Counter
+    module_counts: dict[str, int] = {}
+    for t in course.topics:
+        if t.module:
+            module_counts[t.module] = module_counts.get(t.module, 0) + 1
+    courses_list: list[str] = [
+        f"{mod} ({cnt} topic{'s' if cnt != 1 else ''})"
+        for mod, cnt in module_counts.items()
+    ]
+
+    return ParseSyllabusOutput(course=course, warnings=warnings, courses_list=courses_list)
 
 
 @mcp.tool
@@ -770,6 +793,93 @@ def setup_notion_database(inp: SetupNotionDatabaseInput) -> SetupNotionDatabaseO
         )
 
 
+class SetupDailyNotionDatabaseInput(BaseModel):
+    notion_token: str = Field(description="Your Notion integration token (starts with 'secret_...').")
+    parent_page_id: str = Field(
+        description=(
+            "The Notion page ID where the database will be created. "
+            "Open the page in Notion, copy the URL — the ID is the 32-char hex after the last '/'."
+        )
+    )
+    database_title: str = Field(default="Daily Study Plan", description="Title for the new database.")
+
+
+class SetupDailyNotionDatabaseOutput(BaseModel):
+    database_id: str
+    database_url: str
+    message: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+@mcp.tool
+def setup_daily_notion_database(inp: SetupDailyNotionDatabaseInput) -> SetupDailyNotionDatabaseOutput:
+    """
+    Create the Notion database for the DAILY study plan (one row per day).
+
+    Schema: Name | Date | Day | Topics | Details | Total Minutes | Done (checkbox)
+
+    - Name:          "2026-06-02 — Monday"
+    - Date:          the calendar date
+    - Day:           "Monday, 02 Jun 2026"
+    - Topics:        all topic titles for that day (newline-separated)
+    - Details:       per-session breakdown "[learn] Topic — 60 min"
+    - Total Minutes: total study time that day
+    - Done:          checkbox to mark the day complete
+    - Key / PlanKey: internal idempotency keys (do not edit)
+
+    Run this once, then use the returned database_id as notion_daily_database_id in full_pipeline.
+    """
+    import requests as _req
+
+    headers = {
+        "Authorization": f"Bearer {inp.notion_token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "parent": {"type": "page_id", "page_id": inp.parent_page_id},
+        "title": [{"type": "text", "text": {"content": inp.database_title}}],
+        "properties": {
+            "Name": {"title": {}},
+            "Date": {"date": {}},
+            "Day": {"rich_text": {}},
+            "Topics": {"rich_text": {}},
+            "Details": {"rich_text": {}},
+            "Total Minutes": {"number": {"format": "number"}},
+            "Done": {"checkbox": {}},
+            "Key": {"rich_text": {}},
+            "PlanKey": {"rich_text": {}},
+        },
+    }
+    try:
+        resp = _req.post(
+            "https://api.notion.com/v1/databases",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        db = resp.json()
+        db_id = db["id"]
+        db_url = db.get("url", f"https://notion.so/{db_id.replace('-', '')}")
+        return SetupDailyNotionDatabaseOutput(
+            database_id=db_id,
+            database_url=db_url,
+            message=(
+                f"Daily study plan database '{inp.database_title}' created. "
+                f"Use database_id='{db_id}' as notion_daily_database_id in full_pipeline."
+            ),
+            warnings=[],
+        )
+    except Exception as exc:
+        return SetupDailyNotionDatabaseOutput(
+            database_id="",
+            database_url="",
+            message="Failed to create database. See warnings.",
+            warnings=[str(exc)],
+        )
+
+
 class FullPipelineInput(BaseModel):
     content_type: Literal["pdf_base64", "text", "docx_base64", "html", "url"] = Field(
         description=(
@@ -779,6 +889,12 @@ class FullPipelineInput(BaseModel):
     content: str = Field(description="Base64 PDF/DOCX bytes, plain text, raw HTML, or a URL.")
     timezone: str = Field(default="UTC", description="Your timezone, e.g. 'Asia/Kolkata'.")
     hours_per_day: float = Field(default=1.5, description="Study hours available per day.")
+    session_minutes: int = Field(
+        default=60,
+        ge=15,
+        le=180,
+        description="Minutes of focused study per session (per day in coverage mode). Default 60.",
+    )
     days_off: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(
         default_factory=list,
         description="Days you cannot study, e.g. ['fri', 'sat'].",
@@ -787,21 +903,88 @@ class FullPipelineInput(BaseModel):
         default=None,
         description="When to start studying. Defaults to today.",
     )
+
+    # ── Plan mode ─────────────────────────────────────────────────────────────
+    plan_mode: Literal["spaced_repetition", "coverage"] = Field(
+        default="spaced_repetition",
+        description=(
+            "'spaced_repetition': classic SR schedule anchored to exam dates. "
+            "'coverage': daily sequential coverage — one topic per day, spread evenly "
+            "from course_start_date to study_end_date. No exam date needed."
+        ),
+    )
+    study_end_date: str | None = Field(
+        default=None,
+        description=(
+            "End date for coverage mode (ISO format 'YYYY-MM-DD'). "
+            "E.g. 4 months from today for a semester plan. "
+            "Defaults to course_start_date + 120 days if omitted."
+        ),
+    )
+    tutorial_dates: list[dict] | None = Field(
+        default=None,
+        description=(
+            "Upcoming tutorial/test dates. Each entry must be a dict with keys: "
+            "'date' (ISO date), 'topic_hint' (topic name), 'prep_days' (int, default 3). "
+            "Example: [{\"date\": \"2026-07-20\", \"topic_hint\": \"Data Structures\", \"prep_days\": 3}]. "
+            "Tutorial days are blocked on the calendar; the N study days before each tutorial "
+            "become focused prep days for that topic only."
+        ),
+    )
+
+    # ── Exam overrides (spaced_repetition mode) ────────────────────────────────
     manual_exam_dates: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Override or add exam dates. Key = exam name, value = date string 'YYYY-MM-DD'. "
-            "Use this when the syllabus has no explicit dates (e.g. week-based schedules)."
+            "Override or add exam dates. Key = exam name, value = ISO date 'YYYY-MM-DD'. "
+            "Use when the syllabus has no explicit dates (e.g. week-based schedules)."
         ),
     )
     boost_keywords: list[str] = Field(
         default_factory=list,
         description="Extra keywords to boost topic importance (e.g. ['networking', 'security']).",
     )
-    export_format: Literal["ics", "json"] = Field(
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    export_format: Literal["ics", "json", "notion", "notion_daily", "google_calendar"] = Field(
         default="ics",
-        description="Output format: 'ics' (importable calendar) or 'json' (raw data).",
+        description=(
+            "Output format: "
+            "'ics' — importable .ics calendar file; "
+            "'json' — raw plan data; "
+            "'notion' — push to Notion (one row per session, requires notion_token + notion_database_id); "
+            "'notion_daily' — push to Notion as a daily plan (one row per day with all topics listed, "
+            "requires notion_token + notion_daily_database_id — run setup_daily_notion_database first); "
+            "'google_calendar' — push to Google Calendar (requires gcal_access_token)."
+        ),
     )
+
+    # ── Notion credentials ─────────────────────────────────────────────────────
+    notion_token: str | None = Field(
+        default=None,
+        description="Notion integration token (starts with 'secret_...'). Required for notion exports.",
+    )
+    notion_database_id: str | None = Field(
+        default=None,
+        description="Notion database ID for 'notion' export (session-per-row). Use setup_notion_database to create it.",
+    )
+    notion_daily_database_id: str | None = Field(
+        default=None,
+        description=(
+            "Notion database ID for 'notion_daily' export (day-per-row). "
+            "Use setup_daily_notion_database to create it."
+        ),
+    )
+
+    # ── Google Calendar credentials ────────────────────────────────────────────
+    gcal_access_token: str | None = Field(
+        default=None,
+        description="Google OAuth2 access token. Required for 'google_calendar' export.",
+    )
+    gcal_refresh_token: str | None = Field(default=None, description="Google OAuth2 refresh token.")
+    gcal_client_id: str | None = Field(default=None, description="Google OAuth2 client ID.")
+    gcal_client_secret: str | None = Field(default=None, description="Google OAuth2 client secret.")
+    gcal_calendar_id: str = Field(default="primary", description="Google Calendar ID to push events to.")
 
 
 class FullPipelineOutput(BaseModel):
@@ -811,11 +994,18 @@ class FullPipelineOutput(BaseModel):
     sessions_total: int
     plan_start: str
     plan_end: str
+    plan_mode: str = "spaced_repetition"
+    tutorial_days_scheduled: int = 0
+    prep_days_scheduled: int = 0
     report: str
     export_format: str
     export_data: Any
     warnings: list[str] = Field(default_factory=list)
     is_syllabus: bool = True
+    courses_list: list[str] = Field(
+        default_factory=list,
+        description="Distinct courses/modules found (non-empty for multi-course program syllabi).",
+    )
     raw_text_preview: str = Field(
         default="",
         description=(
@@ -830,15 +1020,25 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
     """
     One-call end-to-end pipeline: upload a syllabus and get a complete study plan.
 
-    Runs: parse → detect exam dates → apply manual corrections → weight topics →
-    generate day-by-day schedule → build readable report → export ICS or JSON.
+    TWO MODES:
+    - plan_mode='spaced_repetition' (default): classic SR schedule anchored to exam dates.
+      Supply real exam dates via manual_exam_dates when the syllabus has none.
+    - plan_mode='coverage': everyday sequential coverage over a fixed date window.
+      No exam date needed. Provide study_end_date (e.g. 4 months from today).
+      Optionally provide tutorial_dates so the MCP automatically blocks tutorial days
+      and dedicates the N days before each tutorial to focused prep for that topic.
 
-    Use manual_exam_dates to provide real dates when the syllabus is week-based
-    (no explicit calendar dates). Example: {"Final Exam": "2026-09-10"}.
+    EXPORTS:
+    - 'ics'           → importable .ics calendar file (returned in export_data.ics)
+    - 'json'          → raw plan JSON
+    - 'notion'        → push sessions to Notion (one row/session) — needs notion_token + notion_database_id
+    - 'notion_daily'  → push daily plan to Notion (one row/day) — needs notion_token + notion_daily_database_id
+                        (run setup_daily_notion_database once to create the right schema)
+    - 'google_calendar' → push to Google Calendar — needs gcal_access_token
 
-    If topics or title look wrong in the output, check raw_text_preview and then
-    call apply_course_corrections followed by weight_topics / generate_study_plan.
+    If topics or title look wrong, check raw_text_preview and call apply_course_corrections.
     """
+    from datetime import timedelta as _td
     warnings: list[str] = []
 
     # 1) Parse
@@ -893,24 +1093,139 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
     weight_out = weight_topics(WeightTopicsInput(course=course, boost_keywords=inp.boost_keywords))
     course = weight_out.course
 
-    # 5) Generate plan
+    # 5) Build study preferences
     prefs = StudyPreferences(
         course_start_date=inp.course_start_date,
         timezone=inp.timezone,
         hours_per_day=inp.hours_per_day,
+        session_minutes=inp.session_minutes,
         days_off=inp.days_off,
     )
-    plan_out = generate_study_plan(GenerateStudyPlanInput(course=course, preferences=prefs))
-    warnings.extend(plan_out.warnings)
-    plan = plan_out.plan
-    plan.meta["generated_at"] = datetime.now(timezone.utc).isoformat()
 
-    # 6) Build report
+    # 6) Generate plan (mode-aware)
+    tutorial_days_scheduled = 0
+    prep_days_scheduled = 0
+
+    if inp.plan_mode == "coverage":
+        # Resolve study_end_date
+        start = inp.course_start_date or date.today()
+        if inp.study_end_date:
+            try:
+                from dateutil import parser as _dp2
+                end_date = _dp2.parse(inp.study_end_date).date()
+            except Exception:
+                warnings.append(f"Could not parse study_end_date '{inp.study_end_date}'; defaulting to start + 120 days.")
+                end_date = start + _td(days=120)
+        else:
+            end_date = start + _td(days=120)
+            warnings.append(
+                "study_end_date not provided for coverage mode; defaulting to 4 months (120 days) from start."
+            )
+
+        if not course.topics:
+            warnings.append(
+                "No topics detected — coverage plan will contain revision sessions only. "
+                "Call get_raw_text to inspect the syllabus and use apply_course_corrections to add topics."
+            )
+
+        plan = generate_coverage_plan(
+            course, prefs,
+            study_end_date=end_date,
+            tutorial_dates=inp.tutorial_dates,
+        )
+        plan.meta["generated_at"] = datetime.now(timezone.utc).isoformat()
+
+        from syllabus_mcp.models import SessionType as _ST
+        tutorial_days_scheduled = sum(1 for s in plan.sessions if s.session_type == _ST.tutorial)
+        prep_days_scheduled = sum(1 for s in plan.sessions if s.session_type == _ST.tutorial_prep)
+
+        if inp.tutorial_dates and tutorial_days_scheduled == 0:
+            warnings.append(
+                "tutorial_dates were provided but no tutorial sessions were scheduled — "
+                "check that dates fall within the study window."
+            )
+
+    else:  # spaced_repetition
+        plan_out = generate_study_plan(GenerateStudyPlanInput(course=course, preferences=prefs))
+        warnings.extend(plan_out.warnings)
+        plan = plan_out.plan
+        plan.meta["generated_at"] = datetime.now(timezone.utc).isoformat()
+
+    # 7) Build human-readable report
     report_out = build_plan_report(BuildPlanReportInput(course=course, plan=plan, include_markdown=True))
 
-    # 7) Export
-    export_out = export_plan(ExportPlanInput(plan=plan, format=inp.export_format, target={}))
-    warnings.extend(export_out.warnings)
+    # 8) Export
+    export_format = inp.export_format
+    export_data: Any = None
+    export_warnings: list[str] = []
+
+    if export_format == "json":
+        export_data = plan.model_dump()
+
+    elif export_format == "ics":
+        export_data = {"ics": plan_to_ics(plan)}
+
+    elif export_format == "notion":
+        if not inp.notion_token:
+            export_warnings.append("Provide notion_token for Notion export.")
+        elif not inp.notion_database_id:
+            export_warnings.append(
+                "Provide notion_database_id for Notion export. "
+                "Run setup_notion_database to create the database first."
+            )
+        else:
+            try:
+                res = push_plan_to_notion(
+                    plan,
+                    notion_token=inp.notion_token,
+                    database_id=inp.notion_database_id,
+                )
+                export_data = {"created": res.created, "updated": res.updated, "database_id": res.database_id}
+            except Exception as exc:
+                export_warnings.append(f"Notion export failed: {exc}")
+
+    elif export_format == "notion_daily":
+        if not inp.notion_token:
+            export_warnings.append("Provide notion_token for Notion daily export.")
+        elif not inp.notion_daily_database_id:
+            export_warnings.append(
+                "Provide notion_daily_database_id for daily Notion export. "
+                "Run setup_daily_notion_database to create the database first."
+            )
+        else:
+            try:
+                res = push_daily_plan_to_notion(
+                    plan,
+                    notion_token=inp.notion_token,
+                    database_id=inp.notion_daily_database_id,
+                )
+                export_data = {
+                    "created": res.created,
+                    "updated": res.updated,
+                    "days_total": res.days_total,
+                    "database_id": res.database_id,
+                }
+            except Exception as exc:
+                export_warnings.append(f"Notion daily export failed: {exc}")
+
+    elif export_format == "google_calendar":
+        if not inp.gcal_access_token:
+            export_warnings.append("Provide gcal_access_token for Google Calendar export.")
+        else:
+            try:
+                gcal_res = push_plan_to_google_calendar(
+                    plan,
+                    access_token=inp.gcal_access_token,
+                    refresh_token=inp.gcal_refresh_token,
+                    client_id=inp.gcal_client_id,
+                    client_secret=inp.gcal_client_secret,
+                    calendar_id=inp.gcal_calendar_id,
+                )
+                export_data = gcal_res.__dict__
+            except Exception as exc:
+                export_warnings.append(f"Google Calendar export failed: {exc}")
+
+    warnings.extend(export_warnings)
 
     return FullPipelineOutput(
         course_title=course.course_title,
@@ -919,11 +1234,15 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
         sessions_total=len(plan.sessions),
         plan_start=plan.start_date.isoformat(),
         plan_end=plan.end_date.isoformat(),
+        plan_mode=inp.plan_mode,
+        tutorial_days_scheduled=tutorial_days_scheduled,
+        prep_days_scheduled=prep_days_scheduled,
         report=report_out.report,
-        export_format=export_out.format,
-        export_data=export_out.result,
+        export_format=export_format,
+        export_data=export_data,
         warnings=warnings,
         is_syllabus=is_syl,
+        courses_list=parse_out.courses_list,
         raw_text_preview=(course.extracted_text_summary or "")[:1500],
     )
 
