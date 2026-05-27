@@ -8,8 +8,14 @@ __pycache__/
 *.log
 token.json
 credentials.json
+client_secret.json
 syllabus.b64
 syllabus.pdf
+*.pdf
+*.docx
+*.html
+html_syllabus.txt
+syllabus_to_study_plan_mcp.egg-info/
 plan.ics
 plan_v2.ics
 study_report.md
