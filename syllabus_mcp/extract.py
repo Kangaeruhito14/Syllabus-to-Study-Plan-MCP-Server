@@ -55,6 +55,10 @@ _TOPIC_BLOCKERS = {
     "office hours", "accommodations", "integrity", "disability",
     "withdraw", "copyright", "plagiarism", "prerequisites", "textbook",
     "required materials", "course description", "instructor",
+    "room", "classroom", "location", "http://", "https://",
+    "no class", "holiday", "spring break", "fall break", "thanksgiving",
+    "information", "student development", "participation", "grade points",
+    "learning activities", "learning objective", "approximate time",
 }
 _TOPIC_SECTION_HINTS = {
     "schedule", "weekly", "topics", "course outline", "tentative calendar",
@@ -127,6 +131,20 @@ def _normalize_title(raw: str) -> str:
     return s
 
 
+_PAGE_HEADER_RE = re.compile(r"^page\s+\d+\s+of\s+\d+", re.IGNORECASE)
+_OCR_BULLET_RE = re.compile(r"^[oOeE°]\s+")  # OCR misreads bullets as 'o', 'e', '°'
+_OBJECTIVE_SENT_RE = re.compile(
+    r"^(?:to\s+(?:understand|develop|learn|trace|explore|apply|analyze|analyse|study|examine|provide|help|enable|"
+    r"identify|introduce|create|demonstrate|recognize|evaluate|describe|explain|compare|build|foster|"
+    r"facilitate|promote|prepare|encourage|use|utilize|engage|assess|cultivate|familiarize|equip|enhance|"
+    r"strengthen|acquire|discuss|review|investigate|explore)|"
+    r"students?\s+will|the\s+students?\s+will|you\s+will|upon\s+completion|learners?\s+will|"
+    r"this\s+course\s+will|participants?\s+will)",
+    re.IGNORECASE,
+)
+_VERSION_LINE_RE = re.compile(r"^v\.\d+\s+dated|^version\s+\d", re.IGNORECASE)
+
+
 def _line_is_noise(raw: str) -> bool:
     low = raw.lower().strip()
     if not low or len(low) < 3:
@@ -139,7 +157,30 @@ def _line_is_noise(raw: str) -> bool:
         return True
     if len(raw) > 250:
         return True
+    # Skip page header artifacts like "Page 1 of 8"
+    if _PAGE_HEADER_RE.match(low):
+        return True
+    # Skip pure version strings
+    if _VERSION_LINE_RE.match(raw):
+        return True
+    # Skip standalone numbers or short letter codes
+    if re.match(r"^\d+\.?\s*$", raw):
+        return True
+    # Skip lines starting with punctuation (HTML fragment artifacts or OCR artifacts)
+    if raw and raw[0] in ",;:.)]-=":
+        return True
+    # Skip fragment titles: start with 1-3 char all-lowercase word (likely mid-word split)
+    first_word = raw.split()[0] if raw.split() else ""
+    if len(first_word) <= 3 and first_word.islower() and not first_word.endswith("."):
+        return True
     return False
+
+
+def _strip_ocr_artifacts(line: str) -> str:
+    """Remove leading OCR-misread bullets ('o ', 'e ') and stray dashes."""
+    line = _OCR_BULLET_RE.sub("", line.strip())
+    line = re.sub(r"^[-–—]\s+", "", line)
+    return line.strip()
 
 
 def _guess_assessment_type(name: str) -> AssessmentType:
@@ -178,6 +219,9 @@ def _detect_course_title(pages: list[TextPage]) -> tuple[str | None, float]:
     m = label_re.search(norm)
     if m:
         candidate = _normalize_title(m.group(1)).strip()
+        # Strip "Course Credits: N" suffix that can trail on the same label line
+        candidate = re.sub(r"\s+course\s+credits?\s*[:=]\s*\d+.*$", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\s*:\s*\d+\s*credits?.*$", "", candidate, flags=re.IGNORECASE).strip()
         if candidate and not _line_is_noise(candidate) and len(candidate) < 150:
             return candidate[:120], 0.92
 
@@ -186,20 +230,44 @@ def _detect_course_title(pages: list[TextPage]) -> tuple[str | None, float]:
     for page in pages[:2]:
         lines = [_normalize_line(ln.strip()) for ln in page.text.splitlines() if ln.strip()]
         for ln in lines[:20]:
-            if code_re.search(ln) and not _line_is_noise(ln) and len(ln) < 120:
-                cleaned = re.sub(r"^(course\s*[:–\-]\s*)", "", ln, flags=re.IGNORECASE).strip()
+            cleaned = _strip_ocr_artifacts(ln)
+            if code_re.search(cleaned) and not _line_is_noise(cleaned) and len(cleaned) < 120:
+                cleaned = re.sub(r"^(course\s*[:–\-]\s*)", "", cleaned, flags=re.IGNORECASE).strip()
+                # Skip if it's just a code embedded in a long sentence
+                if len(cleaned.split()) > 12:
+                    continue
                 return _normalize_title(cleaned)[:120], 0.85
 
     # 3) First meaningful line on page 1 that is not a generic header
-    generic_headers = {"course syllabus", "syllabus", "class syllabus", "course outline"}
+    generic_headers = {
+        "course syllabus", "syllabus", "class syllabus", "course outline",
+        "syllabus and course information", "course information", "on-campus course syllabus",
+        "online course syllabus", "course syllabus template", "common syllabus content",
+    }
+    _skip_title_re = re.compile(
+        r"^page\s+\d+|^\d+\s*$|^v\.\d+|^version\s+\d|^printed|^last\s+updated|"
+        r"course\s*credits?\s*[:=]|^subject\s*code",
+        re.IGNORECASE,
+    )
     if pages:
         lines = [_normalize_line(ln.strip()) for ln in pages[0].text.splitlines() if ln.strip()]
-        for ln in lines[:10]:
+        for ln in lines[:15]:
             low = ln.lower().strip()
+            cleaned = _strip_ocr_artifacts(ln)
+            if not cleaned:
+                continue
             if low in generic_headers:
                 continue
-            if not _line_is_noise(ln) and 5 < len(ln) < 120:
-                return _normalize_title(ln)[:120], 0.45
+            if _skip_title_re.search(cleaned):
+                continue
+            # Strip trailing "Course Credits: 2" style suffixes
+            cleaned = re.sub(r"\s+course\s+credits?\s*[:=]\s*\d+.*$", "", cleaned, flags=re.IGNORECASE).strip()
+            # Strip trailing ":  2 credits" style
+            cleaned = re.sub(r"\s*:\s*\d+\s*credits?.*$", "", cleaned, flags=re.IGNORECASE).strip()
+            if not cleaned:
+                continue
+            if not _line_is_noise(cleaned) and 5 < len(cleaned) < 120:
+                return _normalize_title(cleaned)[:120], 0.45
 
     return None, 0.0
 
@@ -210,7 +278,7 @@ def _extract_topics_week_module(lines: list[str], page_num: int) -> list[Topic]:
     """Week 1: ... / Module 2: ... / Lecture 3: ..."""
     topics: list[Topic] = []
     pattern = re.compile(
-        r"^(?:week|wk|module|lecture|unit|class|session)\s*(\d{1,3})?\s*[:.\-–—]?\s*(.+)$",
+        r"^(?:week|wk|module|lecture|unit|class|session)\b\s*(\d{1,3})?\s*[:.\-–—]?\s*(.+)$",
         flags=re.IGNORECASE,
     )
     for ln in lines:
@@ -220,7 +288,29 @@ def _extract_topics_week_module(lines: list[str], page_num: int) -> list[Topic]:
         week_num = int(m.group(1)) if m.group(1) else None
         title = m.group(2).strip(" -:;")
         title = re.sub(_DATE_RE, "", title).strip(" -:;")
+        # Strip Roman numeral section prefix (e.g. "I: Topic" or "Il: Topic" from OCR)
+        title = re.sub(r"^(?:I{1,3}|I[Vl]|V?I{0,3}|Il{1,2}|Ill?):\s*", "", title).strip(" -:;")
+        # Strip "[N lectures/hrs]" or "(N lectures/hrs)" bracketed suffixes
+        title = re.sub(r"\s*[\[\(]\d+\s*(?:lectures?|hrs?\.?|hours?|classes?|sessions?)[\]\)].*$", "", title, flags=re.IGNORECASE).strip()
+        # Strip "Two weeks", "Three weeks" etc schedule-column suffixes
+        title = re.sub(r"\s+(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+weeks?\s*$", "", title, flags=re.IGNORECASE).strip()
+        # Strip trailing period left after cleaning
+        title = title.rstrip(".")
         if not title or _line_is_noise(title) or len(title.split()) > 14:
+            continue
+        # Reject punctuation-heavy or too-short fragments
+        if re.match(r"^[\W\d\s]+$", title) or len(title) < 4:
+            continue
+        # Reject sentence fragments (start lowercase + ends with ")." or similar)
+        if title[0].islower() and re.search(r"[)\]\.]{1,2}$", title) and len(title.split()) <= 3:
+            continue
+        # Reject exam/test/quiz days in schedule (caught by assessment extractor)
+        if re.search(r"\b(exam|midterm|final|test\s*\d|quiz)\b", title, re.IGNORECASE):
+            continue
+        # Reject generic schedule column labels (activity types, not topics)
+        if re.match(r"^(?:activity|discussion|assignments?|quiz|review|resources?|readings?)\s*\d*$", title, re.IGNORECASE):
+            continue
+        if re.search(r"\bcritical\s+thinking\s+questions?\b", title, re.IGNORECASE):
             continue
         topics.append(Topic(
             title=_normalize_title(title)[:160],
@@ -235,30 +325,82 @@ def _extract_topics_week_module(lines: list[str], page_num: int) -> list[Topic]:
 def _extract_topics_date_column(lines: list[str], page_num: int, default_year: int | None) -> list[Topic]:
     """
     Table/schedule style: `Jan 13   Introduction to Databases   Ch. 1`
-    The date is in column 1, topic in column 2.
-    Handles both whitespace-separated and tab-separated layouts.
+    Also handles: `3 5/31/16 Sources of Demographic Data. Ch. 4` (row# before date).
     """
     topics: list[Topic] = []
+    # Pattern 1: date at start of line
     date_lead_re = re.compile(
         rf"^(?:{_MONTH_NAMES})\s+\d{{1,2}}(?:,\s*\d{{4}})?\s+(.+)"
         rf"|^\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?\s+(.+)",
         flags=re.IGNORECASE,
     )
+    # Pattern 2: row_number then date (e.g. "3 5/31/16 Sources of Demographic Data.")
+    row_date_re = re.compile(
+        rf"^\d{{1,2}}\s+(?:(?:{_MONTH_NAMES})\s+\d{{1,2}}(?:,\s*\d{{4}})?|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+(.+)",
+        flags=re.IGNORECASE,
+    )
+    # Pattern 3: weekday abbrev + date (e.g. "M 8/25 Orientation Meeting" or "W 9/10 ...")
+    _WD = r"(?:M|T|W|Th|F|Sa|Su|Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+    weekday_date_re = re.compile(
+        rf"^{_WD}\s+(?:(?:{_MONTH_NAMES})\s+\d{{1,2}}(?:,\s*\d{{4}})?|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+(.+)",
+        flags=re.IGNORECASE,
+    )
     for ln in lines:
         raw = ln.strip()
+        remainder = None
         m = date_lead_re.match(raw)
-        if not m:
+        if m:
+            remainder = (m.group(1) or m.group(2) or "").strip()
+        elif row_date_re.match(raw):
+            remainder = row_date_re.match(raw).group(1).strip()
+        elif weekday_date_re.match(raw):
+            # Split by 3+ spaces to isolate the topic column from chapter ref column
+            parts = re.split(r"\s{3,}", raw, maxsplit=3)
+            if len(parts) >= 3:
+                remainder = parts[1].strip()  # topic is middle column
+            else:
+                remainder = weekday_date_re.match(raw).group(1).strip()
+        if remainder is None:
             continue
-        # group 1 or group 2 is the remainder after the date
-        remainder = (m.group(1) or m.group(2) or "").strip()
-        # strip trailing reading reference like "Ch. 3" or "pp. 40-60"
+        # Skip time-only remainders like "12-1 pm" (exam time slots, not topics)
+        if re.match(r"^\d+[-–]\d+\s*(?:am|pm)?$", remainder, re.IGNORECASE):
+            continue
+        # Skip first-day "Syllabus" review sessions (not a study topic)
+        if re.match(r"^syllabus\b", remainder, re.IGNORECASE):
+            continue
+        # Strip "Web Movies, ..." style in-line media annotations before other strips
+        remainder = re.sub(r"\s+Web\s+Movies?(?:[,\s].*)?$", "", remainder, flags=re.IGNORECASE).strip()
+        # Strip trailing reading/textbook references: "Ch. 3", "pp. 40-60", "ExSyn: 31-35", "WB: Lesson 2"
         remainder = re.sub(r"\s+(ch(?:apter)?\.?\s*\d+[\w\-,\s]*|pp?\.?\s*\d+.*)$", "", remainder, flags=re.IGNORECASE).strip()
-        # strip percentage references like "30%"
+        # Strip abbreviated textbook refs like "ExSyn: 31", "WB:", "NA 27", biblical refs like "Phil 1:1"
+        remainder = re.sub(r"\s+[A-Z][a-zA-Z]{0,6}:\s*[\w\-]+.*$", "", remainder).strip()
+        # Strip trailing chapter code patterns like "C1, R3", "BV,G1-4", "BV,G 1-4", "Web Movies, C6"
+        remainder = re.sub(r"\s+(?:[A-Z]{1,4}\s*\d+)(?:[,\s]+(?:[A-Z]{1,4}\s*\d+|Web\s+\w+))*\s*$", "", remainder).strip()
+        # Also strip orphaned capital-letter abbreviation clusters (e.g. "BV,G" after digit stripping)
+        remainder = re.sub(r"\s+[A-Z]{1,4}(?:,[A-Z]{1,4})*\s*$", "", remainder).strip()
+        # Strip composite textbook codes like "BV,G 1-4" (letter+comma+letter+space+digits, with optional space)
+        remainder = re.sub(r"\s+[A-Z]{1,4}(?:,[A-Z]{1,4})+\s*\d+(?:[-,\s–]*\d+)*\s*$", "", remainder).strip()
+        # Strip trailing "none", "Quiz N", standalone digits, and similar noise
+        remainder = re.sub(r"\s+(?:none|quiz\s*\d+|\d{1,3}-\d{1,3})\s*.*$", "", remainder, flags=re.IGNORECASE).strip()
+        # Strip percentage references like "30%"
         remainder = re.sub(r"\s+\d+%$", "", remainder).strip()
+        # Strip orphaned 1-3 char abbreviated words at end (e.g. "intro to case Ex" → "intro to case")
+        remainder = re.sub(r"\s+[A-Z][a-zA-Z]{0,2}\s*$", "", remainder).strip()
+        # Strip trailing commas left after code stripping
+        remainder = remainder.rstrip(",").strip()
         if not remainder or _line_is_noise(remainder) or len(remainder.split()) > 14:
             continue
         # Skip if the remainder itself looks like an exam/admin line we'd catch elsewhere
         if any(b in remainder.lower() for b in _ASSESSMENT_BLOCKERS):
+            continue
+        # Skip assessment lines (exam/test/quiz day in schedule) and checkpoint-type items
+        if re.search(r"\b(exam|midterm|final|test\s*\d|quiz\s*\d|checkpoint)\b", remainder, re.IGNORECASE):
+            continue
+        # Skip activity/assignment column headers in schedule tables
+        if re.search(r"\bcritical\s+thinking\s+questions?\b", remainder, re.IGNORECASE):
+            continue
+        # Skip grading weight lines
+        if re.search(r"\d+\s*%", remainder):
             continue
         topics.append(Topic(
             title=_normalize_title(remainder)[:160],
@@ -330,6 +472,46 @@ def _extract_topics_objectives(lines: list[str], page_num: int) -> list[Topic]:
     return topics
 
 
+def _extract_topics_multicolumn_table(raw_lines: list[str], page_num: int) -> list[Topic]:
+    """
+    Multi-column schedule table detected by 3+ space column separators.
+    Handles ASTR-style:  'M 8/25        Orientation Meeting        BV,G1-4'
+    Operates on RAW (un-normalized) lines to preserve spacing.
+    """
+    topics: list[Topic] = []
+    _WD = r"(?:M|T|W|Th|F|Sa|Su|Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+    date_prefix_re = re.compile(
+        rf"^\s*(?:\d{{1,2}}\s+)?(?:{_WD}\s+)?(?:\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?|(?:{_MONTH_NAMES})\s+\d{{1,2}}(?:,\s*\d{{4}})?)",
+        flags=re.IGNORECASE,
+    )
+    for ln in raw_lines:
+        stripped = ln.strip()
+        if not date_prefix_re.match(stripped):
+            continue
+        if not re.search(r"\s{3,}", stripped):
+            continue
+        parts = re.split(r"\s{3,}", stripped)
+        if len(parts) < 2:
+            continue
+        topic_part = parts[1].strip()
+        # Strip trailing textbook codes that weren't separated by 3+ spaces (e.g. "Conduction C4")
+        topic_part = re.sub(r"\s+(?:[A-Z]{1,4}\s*\d+)(?:[,\s]+(?:[A-Z]{1,4}\s*\d+|Web\s+\w+))*\s*$", "", topic_part).strip()
+        topic_part = re.sub(r"\s+[A-Z]{1,4}(?:,[A-Z]{1,4})*\s*$", "", topic_part).strip()
+        topic_part = topic_part.rstrip(",").strip()
+        if not topic_part or _line_is_noise(topic_part):
+            continue
+        if re.search(r"\b(exam|midterm|final|test\s*\d|quiz)\b", topic_part, re.IGNORECASE):
+            continue
+        if re.search(r"\d+\s*%", topic_part):
+            continue
+        topics.append(Topic(
+            title=_normalize_title(topic_part)[:160],
+            cues=["multicolumn_table"],
+            source={"page": page_num, "line": ln},
+        ))
+    return topics
+
+
 def _extract_topics_numbered_in_section(lines: list[str], page_num: int) -> list[Topic]:
     """
     Numbered list items inside a detected topic/schedule section.
@@ -351,7 +533,23 @@ def _extract_topics_numbered_in_section(lines: list[str], page_num: int) -> list
         m = enum_re.match(ln)
         if m:
             title = m.group(2).strip()
-            if title and not _line_is_noise(title) and len(title.split()) <= 14:
+            # Skip grading-weight items like "3. Weekly homework (50%): ..."
+            if re.search(r"\d+\.?\d*%", title):
+                continue
+            # Skip bibliography/book references (contain publisher keywords or "Author, Firstname, Title" pattern)
+            if re.search(
+                r"\b(?:Oxford|Cambridge|University Press|Publishing|Monographs|Theological|Eerdmans|Zondervan|Pearson|Macmillan|Routledge|edition|ed\.)\b",
+                title, re.IGNORECASE
+            ):
+                continue
+            # "Surname, Firstname/Initial, Book title..." format (bibliography entry)
+            if re.match(r"^[A-Z][a-z]+,\s*(?:[A-Z][a-z]+|[A-Z]\.?)[,\s]", title):
+                continue
+            # Skip comma-separated assessment-type lists (e.g. "Quiz, MCQ, Assignment, etc")
+            _ASSESS_TERMS = ["quiz", "mcq", "exam", "assignment", "homework", "test"]
+            if sum(1 for k in _ASSESS_TERMS if k in title.lower()) >= 2:
+                continue
+            if title and not _line_is_noise(title) and len(title.split()) <= 12:
                 topics.append(Topic(
                     title=_normalize_title(title)[:160],
                     cues=["numbered_in_section"],
@@ -502,6 +700,15 @@ def _extract_assessments(
             continue
         if len(a.name.split()) > 15:
             continue
+        # Skip URLs
+        if re.search(r"https?://", a.name):
+            continue
+        # Skip lines that are sentences (ends with period + have many words)
+        if a.name.endswith(".") and len(a.name.split()) > 8:
+            continue
+        # Skip clearly noisy patterns
+        if re.match(r"^[\W\d\s]+$", a.name):
+            continue
         cleaned.append(a)
 
     return cleaned
@@ -559,6 +766,7 @@ def extract_course_model_from_pages(
     # ── Topics ────────────────────────────────────────────────────────────────
     all_topics: list[Topic] = []
     for page in pages:
+        raw_lines = [ln for ln in page.text.splitlines() if ln.strip()]
         norm_lines = [_normalize_line(ln.strip()) for ln in page.text.splitlines() if ln.strip()]
 
         # Strategy 1: Week/Module/Lecture prefix
@@ -573,13 +781,29 @@ def extract_course_model_from_pages(
         # Strategy 4: Numbered list inside a detected topic section
         all_topics.extend(_extract_topics_numbered_in_section(norm_lines, page.page_number))
 
+        # Strategy 5: Multi-column table (raw lines to preserve 3+ space separators)
+        all_topics.extend(_extract_topics_multicolumn_table(raw_lines, page.page_number))
+
     # Deduplicate by title (case-insensitive), prefer earlier / higher-priority strategies
     seen_titles: dict[str, Topic] = {}
     for t in all_topics:
-        key = t.title.strip().lower()
+        key = t.title.strip().lower().rstrip(".,;:")
+        # Skip objective-style sentences (learning outcomes that slipped through)
+        if _OBJECTIVE_SENT_RE.match(t.title):
+            continue
         if key and key not in seen_titles:
             seen_titles[key] = t
-    course.topics = list(seen_titles.values())
+    topics_list = list(seen_titles.values())
+
+    # Cap at 60 topics — more indicates a curriculum scheme (multi-subject), not one course
+    MAX_TOPICS = 60
+    if len(topics_list) > MAX_TOPICS:
+        course.constraints_found.append(
+            f"Document contains {len(topics_list)} detected topics — may be a multi-subject curriculum "
+            f"document. Capped at {MAX_TOPICS}. Use apply_course_corrections to refine."
+        )
+        topics_list = topics_list[:MAX_TOPICS]
+    course.topics = topics_list
 
     # ── Assessments ───────────────────────────────────────────────────────────
     course.assessments = _extract_assessments(pages, default_year=default_year)
