@@ -945,6 +945,34 @@ class FullPipelineInput(BaseModel):
         description="Extra keywords to boost topic importance (e.g. ['networking', 'security']).",
     )
 
+    # ── Scheduling behaviour ──────────────────────────────────────────────────
+    study_start_hour: int = Field(
+        default=20,
+        ge=0,
+        le=23,
+        description=(
+            "Hour of day (0-23) when study sessions start on the calendar. "
+            "Default 20 = 8 PM, matching the common student evening study window (6-10 PM). "
+            "Days with both a review + learn session stack them: review at study_start_hour, "
+            "then learn 5 min later."
+        ),
+    )
+    next_day_review: bool = Field(
+        default=True,
+        description=(
+            "Coverage mode: automatically schedule a short review the day AFTER each learn session. "
+            "Day N = learn new topic; Day N+1 = review yesterday's topic (review_minutes) "
+            "then learn the next new topic. This mirrors how memory consolidation works and "
+            "is far more effective than batching all reviews at the end."
+        ),
+    )
+    review_minutes: int = Field(
+        default=25,
+        ge=10,
+        le=60,
+        description="Duration of next-day review sessions in coverage mode (default 25 min).",
+    )
+
     # ── Export ────────────────────────────────────────────────────────────────
     export_format: Literal["ics", "json", "notion", "notion_daily", "google_calendar"] = Field(
         default="ics",
@@ -1020,21 +1048,39 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
     """
     One-call end-to-end pipeline: upload a syllabus and get a complete study plan.
 
-    TWO MODES:
-    - plan_mode='spaced_repetition' (default): classic SR schedule anchored to exam dates.
-      Supply real exam dates via manual_exam_dates when the syllabus has none.
-    - plan_mode='coverage': everyday sequential coverage over a fixed date window.
-      No exam date needed. Provide study_end_date (e.g. 4 months from today).
-      Optionally provide tutorial_dates so the MCP automatically blocks tutorial days
-      and dedicates the N days before each tutorial to focused prep for that topic.
+    ── PLAN MODES ────────────────────────────────────────────────────────────
+    plan_mode='coverage' (recommended for semester planning):
+      No exam date needed. Topics are assigned sequentially one per day.
+      next_day_review=True (default): Day N = learn new topic (session_minutes),
+      Day N+1 = review yesterday (review_minutes, shown BEFORE that day's new topic).
+      This mirrors how memory consolidation works — not "learn everything, revise later".
+      tutorial_dates: block tutorial days + N prep days before each one automatically.
 
-    EXPORTS:
-    - 'ics'           → importable .ics calendar file (returned in export_data.ics)
-    - 'json'          → raw plan JSON
-    - 'notion'        → push sessions to Notion (one row/session) — needs notion_token + notion_database_id
-    - 'notion_daily'  → push daily plan to Notion (one row/day) — needs notion_token + notion_daily_database_id
-                        (run setup_daily_notion_database once to create the right schema)
-    - 'google_calendar' → push to Google Calendar — needs gcal_access_token
+    plan_mode='spaced_repetition':
+      Classic SR schedule anchored to exam dates.
+      Supply exam dates via manual_exam_dates when the syllabus has none.
+
+    ── STUDY TIMING ──────────────────────────────────────────────────────────
+    study_start_hour (default 20 = 8 PM): all calendar events start at this hour.
+    On days with both a review + new topic, events stack:
+      e.g. 20:00-20:25 [review] Yesterday's topic → 20:30-21:30 [learn] New topic.
+
+    ── DYNAMIC UPDATES ───────────────────────────────────────────────────────
+    Re-calling full_pipeline with ANY changed parameter (different days_off, new
+    tutorial_dates, different study_start_hour, etc.) will automatically:
+      - Update changed sessions in Notion and Google Calendar
+      - Delete sessions that no longer exist in the new plan
+      - Create new sessions
+    This is fully idempotent — no duplicate events are created.
+    Just call full_pipeline again with the updated params whenever the plan changes.
+
+    ── EXPORTS ───────────────────────────────────────────────────────────────
+    'ics'            → importable .ics calendar file (returned in export_data.ics)
+    'json'           → raw plan data
+    'notion'         → push to Notion (one row/session) — needs notion_token + notion_database_id
+    'notion_daily'   → push to Notion (one row/day, with Topics + Details columns)
+                       run setup_daily_notion_database once to create the schema
+    'google_calendar'→ push to Google Calendar — needs gcal_access_token
 
     If topics or title look wrong, check raw_text_preview and call apply_course_corrections.
     """
@@ -1132,6 +1178,8 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
             course, prefs,
             study_end_date=end_date,
             tutorial_dates=inp.tutorial_dates,
+            next_day_review=inp.next_day_review,
+            review_minutes=inp.review_minutes,
         )
         plan.meta["generated_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -1163,7 +1211,7 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
         export_data = plan.model_dump()
 
     elif export_format == "ics":
-        export_data = {"ics": plan_to_ics(plan)}
+        export_data = {"ics": plan_to_ics(plan, study_start_hour=inp.study_start_hour)}
 
     elif export_format == "notion":
         if not inp.notion_token:
@@ -1220,6 +1268,7 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
                     client_id=inp.gcal_client_id,
                     client_secret=inp.gcal_client_secret,
                     calendar_id=inp.gcal_calendar_id,
+                    study_start_hour=inp.study_start_hour,
                 )
                 export_data = gcal_res.__dict__
             except Exception as exc:

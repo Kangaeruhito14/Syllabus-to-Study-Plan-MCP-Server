@@ -211,18 +211,27 @@ def generate_coverage_plan(
     *,
     study_end_date: date,
     tutorial_dates: list[dict[str, Any]] | None = None,
+    next_day_review: bool = True,
+    review_minutes: int = 25,
 ) -> StudyPlan:
     """
     Coverage mode: distribute all topics sequentially across the study window.
+
+    Interleaved learning (next_day_review=True, default):
+    - Day N:   [learn]  new topic  (session_minutes long)
+    - Day N+1: [review] same topic (review_minutes, before that day's new topic)
+    This means every day the student starts with a 25-min recap of yesterday,
+    then moves to the new topic — matching how memory consolidation actually works.
 
     Tutorial-aware:
     - Tutorial days are blocked and marked as SessionType.tutorial.
     - The N study days immediately before each tutorial are marked as
       SessionType.tutorial_prep (review only that tutorial's topic).
-    - Remaining free days receive sequential topic assignments.
+    - Next-day reviews are not scheduled on tutorial/prep days; they fall
+      on the next available free day.
 
-    If there are more free days than topics, revision sessions fill the tail.
-    If there are more topics than free days, multiple topics are combined per day.
+    If there are more free days than topics the tail becomes revision.
+    If there are more topics than free days multiple topics are packed per day.
     """
     start = preferences.course_start_date or course.start_date or date.today()
     days_off = set(preferences.days_off)
@@ -251,7 +260,6 @@ def generate_coverage_plan(
 
     # --- Mark tutorial days and prep days ---
     tutorial_day_set: set[date] = {t[0] for t in tutorial_info}
-    # prep_assignments: date -> topic_hint (study-day only, first-come-first-served)
     prep_assignments: dict[date, str] = {}
 
     for tdate, topic_hint, prep_days_count in tutorial_info:
@@ -276,7 +284,14 @@ def generate_coverage_plan(
     n_topics = len(topics)
     n_free = len(free_days)
 
-    # --- Assign topics to free days ---
+    # --- Assign topics to free days with optional next-day review ---
+    # Layout when next_day_review=True (e.g. 3 topics, 6 free days):
+    #   free[0]: [learn] T1
+    #   free[1]: [review] T1  +  [learn] T2
+    #   free[2]: [review] T2  +  [learn] T3
+    #   free[3]: [review] T3                   ← last review
+    #   free[4]: [practice] Revision
+    #   free[5]: [practice] Revision
     regular_sessions: list[StudySession] = []
 
     if n_free > 0 and n_topics == 0:
@@ -290,16 +305,28 @@ def generate_coverage_plan(
             ))
 
     elif n_free > 0 and n_topics <= n_free:
-        # At most one topic per day; fill remaining with revision
         for i, topic in enumerate(topics):
+            # Learn session on free_days[i]
             regular_sessions.append(StudySession(
                 session_date=free_days[i],
                 topic_title=topic.title,
                 session_type=SessionType.learn,
                 estimated_minutes=session_mins,
-                rationale=["coverage: 1 topic/day"],
+                rationale=["coverage: learn new topic"],
             ))
-        for d in free_days[n_topics:]:
+            # Review session on free_days[i+1] (if available and enabled)
+            if next_day_review and i + 1 < n_free:
+                regular_sessions.append(StudySession(
+                    session_date=free_days[i + 1],
+                    topic_title=topic.title,
+                    session_type=SessionType.review,
+                    estimated_minutes=review_minutes,
+                    rationale=["coverage: next-day review — reinforce yesterday's topic"],
+                ))
+
+        # Revision days: begin after last review slot
+        revision_start = n_topics + 1 if (next_day_review and n_topics < n_free) else n_topics
+        for d in free_days[revision_start:]:
             regular_sessions.append(StudySession(
                 session_date=d,
                 topic_title="Revision / Mixed Practice",
@@ -309,7 +336,7 @@ def generate_coverage_plan(
             ))
 
     elif n_free > 0:
-        # More topics than free days: distribute evenly across days
+        # More topics than free days: distribute evenly (pack multiple per day, no next-day review)
         topic_idx = 0
         for day_idx, d in enumerate(free_days):
             remaining_topics = n_topics - topic_idx
@@ -352,9 +379,14 @@ def generate_coverage_plan(
     ]
 
     all_sessions = regular_sessions + prep_sessions + tutorial_sessions
+    # Sort: by date, then by session type priority within the day
+    _TYPE_ORDER = {
+        "review": 0, "tutorial_prep": 1, "learn": 2,
+        "practice": 3, "buffer": 4, "mock_exam": 5, "tutorial": 6,
+    }
     all_sessions_sorted = sorted(
         all_sessions,
-        key=lambda s: (s.session_date, s.session_type.value, s.topic_title),
+        key=lambda s: (s.session_date, _TYPE_ORDER.get(s.session_type.value, 9), s.topic_title),
     )
 
     return StudyPlan(
@@ -365,6 +397,7 @@ def generate_coverage_plan(
         sessions=all_sessions_sorted,
         meta={
             "mode": "coverage",
+            "next_day_review": next_day_review,
             "days_off": sorted(days_off),
             "topics_count": n_topics,
             "free_days": n_free,
