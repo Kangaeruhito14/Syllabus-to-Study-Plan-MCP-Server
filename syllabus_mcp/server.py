@@ -539,14 +539,15 @@ def apply_course_corrections(inp: CourseCorrectionInput) -> CourseCorrectionOutp
             changes.append(f"assessments_updated={updated}")
 
     remove_assessment_set = {a.strip().lower() for a in inp.remove_assessments if a.strip()}
+    assessments_removed = 0
     if remove_assessment_set:
         before = len(course.assessments)
         course.assessments = [
             a for a in course.assessments if a.name.strip().lower() not in remove_assessment_set
         ]
-        removed = before - len(course.assessments)
-        if removed:
-            changes.append(f"assessments_removed={removed}")
+        assessments_removed = before - len(course.assessments)
+        if assessments_removed:
+            changes.append(f"assessments_removed={assessments_removed}")
         else:
             warnings.append("No assessment names matched remove_assessments.")
 
@@ -574,7 +575,7 @@ def apply_course_corrections(inp: CourseCorrectionInput) -> CourseCorrectionOutp
     dated = [a.scheduled_date for a in course.assessments if a.scheduled_date]
     if dated:
         course.end_date = max(dated)
-    elif remove_assessment_set:
+    elif remove_assessment_set and assessments_removed > 0:
         course.end_date = None
 
     return CourseCorrectionOutput(course=course, changes_applied=changes, warnings=warnings)

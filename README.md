@@ -3,6 +3,7 @@
 [![CI](https://github.com/Kangaeruhito14/Syllabus-to-Study-Plan-MCP-Server/actions/workflows/ci.yml/badge.svg)](https://github.com/Kangaeruhito14/Syllabus-to-Study-Plan-MCP-Server/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![MCPize](https://mcpize.com/badge/@Kangaeruhito14/syllabus-to-study-plan)](https://mcpize.com/mcp/syllabus-to-study-plan)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20stdio-green.svg)](https://modelcontextprotocol.io)
 
 > **Upload your syllabus (PDF, DOCX, HTML, or text). Tell it your semester dates. Get a day-by-day study plan with interleaved review, tutorial-aware scheduling, and live sync to Google Calendar and Notion.**
