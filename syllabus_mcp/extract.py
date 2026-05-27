@@ -63,17 +63,30 @@ _TOPIC_BLOCKERS = {
 _TOPIC_SECTION_HINTS = {
     "schedule", "weekly", "topics", "course outline", "tentative calendar",
     "course calendar", "module", "unit", "course schedule", "class schedule",
-    "lecture schedule", "course content",
+    "lecture schedule", "course content", "course description",
 }
 _TOPIC_SECTION_END_HINTS = {
     "grading", "attendance", "policies", "academic integrity",
     "disability", "office hours", "course policies", "student conduct",
+    "references", "recommended books", "recommended reading", "bibliography",
+    "required textbook", "textbooks", "required texts", "required reading",
+    "course materials", "reading list",
 }
 _OBJECTIVES_SECTION_HINTS = {
     "course objectives", "learning objectives", "learning outcomes",
     "student learning outcomes", "topics covered", "course topics",
     "upon completion", "students will", "you will learn",
 }
+
+# Word-boundary compiled versions of the section hint sets (prevent substring false-positives
+# e.g. "unit" matching inside "opportunity" or "community").
+def _make_section_re(hints: set[str]) -> re.Pattern[str]:
+    pat = "|".join(re.escape(h) for h in sorted(hints, key=len, reverse=True))
+    return re.compile(r"\b(?:" + pat + r")\b", re.IGNORECASE)
+
+_TOPIC_SECTION_RE = _make_section_re(_TOPIC_SECTION_HINTS)
+_TOPIC_SECTION_END_RE = _make_section_re(_TOPIC_SECTION_END_HINTS)
+_OBJECTIVES_SECTION_RE = _make_section_re(_OBJECTIVES_SECTION_HINTS)
 
 _EXAM_DATE_PATTERNS = [
     re.compile(
@@ -137,9 +150,17 @@ _OBJECTIVE_SENT_RE = re.compile(
     r"^(?:to\s+(?:understand|develop|learn|trace|explore|apply|analyze|analyse|study|examine|provide|help|enable|"
     r"identify|introduce|create|demonstrate|recognize|evaluate|describe|explain|compare|build|foster|"
     r"facilitate|promote|prepare|encourage|use|utilize|engage|assess|cultivate|familiarize|equip|enhance|"
-    r"strengthen|acquire|discuss|review|investigate|explore)|"
+    r"strengthen|acquire|discuss|review|investigate|explore|grow|become|make|give|ensure|verify|conduct)|"
     r"students?\s+will|the\s+students?\s+will|you\s+will|upon\s+completion|learners?\s+will|"
-    r"this\s+course\s+will|participants?\s+will)",
+    r"this\s+course\s+will|participants?\s+will|"
+    r"after\s+(?:successful\s+)?completion|"
+    # Bloom's taxonomy imperative-verb learning outcome sentences (5+ word filter applied at call site)
+    r"(?:represent|encode|evaluate|simplify|analyze|analyse|design|implement|describe|demonstrate|"
+    r"apply|identify|synthesize|argue|write|recognize|compute|determine|familiarize|construct|"
+    r"interpret|distinguish|differentiate|relate|solve|calculate|classify|formulate|justify|"
+    r"grasp|obtain|acquire|state|define|list|name|recall|select|measure|perform|operate|"
+    r"predict|generate|infer|compare|contrast|understand|introduce|find|add|subtract|get|"
+    r"learn|become|achieve|expose|cope|deal|grow|make|use|conduct|ensure|verify|test)\s+\S)",
     re.IGNORECASE,
 )
 _VERSION_LINE_RE = re.compile(r"^v\.\d+\s+dated|^version\s+\d", re.IGNORECASE)
@@ -225,6 +246,18 @@ def _detect_course_title(pages: list[TextPage]) -> tuple[str | None, float]:
         if candidate and not _line_is_noise(candidate) and len(candidate) < 150:
             return candidate[:120], 0.92
 
+    # 1.5) "Syllabus/Curriculum for <program>" — catches multi-course program documents
+    prog_re = re.compile(r"(?:syllabus|curriculum|program)\s+(?:for|of)\s+(.+)", re.IGNORECASE)
+    for page in pages[:5]:
+        for ln in [_normalize_line(raw.strip()) for raw in page.text.splitlines() if raw.strip()]:
+            pm = prog_re.match(ln)
+            if pm:
+                candidate = _normalize_title(pm.group(1)).strip()
+                # Remove trailing parenthetical like "(Effective from 2018-19)"
+                candidate = re.sub(r"\s*\(.*\)\s*$", "", candidate).strip()
+                if candidate and not _line_is_noise(candidate) and 5 < len(candidate) < 120:
+                    return candidate[:120], 0.88
+
     # 2) Course-code line anywhere in first 2 pages
     code_re = re.compile(r"\b[A-Z]{2,5}[-\s]?\d{3,4}\b")
     for page in pages[:2]:
@@ -303,6 +336,9 @@ def _extract_topics_week_module(lines: list[str], page_num: int) -> list[Topic]:
             continue
         # Reject sentence fragments (start lowercase + ends with ")." or similar)
         if title[0].islower() and re.search(r"[)\]\.]{1,2}$", title) and len(title.split()) <= 3:
+            continue
+        # Reject prose continuation after section keyword (e.g. "unit concentrates on...")
+        if title[0].islower() and len(title.split()) > 3:
             continue
         # Reject exam/test/quiz days in schedule (caught by assessment extractor)
         if re.search(r"\b(exam|midterm|final|test\s*\d|quiz)\b", title, re.IGNORECASE):
@@ -423,13 +459,13 @@ def _extract_topics_objectives(lines: list[str], page_num: int) -> list[Topic]:
     for ln in lines:
         low = ln.lower().strip()
 
-        # Detect section start
-        if any(hint in low for hint in _OBJECTIVES_SECTION_HINTS):
+        # Detect section start (word-boundary match)
+        if _OBJECTIVES_SECTION_RE.search(low):
             in_section = True
             continue
 
-        # Detect section end
-        if in_section and any(hint in low for hint in _TOPIC_SECTION_END_HINTS):
+        # Detect section end — including "course description" which opens the topic section
+        if in_section and (_TOPIC_SECTION_END_RE.search(low) or "course description" in low):
             in_section = False
             continue
         # Also end on a blank-ish line after collecting some topics, unless still seeing bullets
@@ -444,17 +480,27 @@ def _extract_topics_objectives(lines: list[str], page_num: int) -> list[Topic]:
             m = pat.match(ln)
             if m:
                 title = m.group(1).strip()
+                # Strip leading "N " prefix from double-numbered items (e.g. "1. 1 Crystal Structure")
+                title = re.sub(r"^\d+\s+", "", title).strip()
                 # Strip trailing separators like "● Nouns, Adjectives, and Articles● Pronouns"
-                # (when bullets are on one line separated by ●)
                 sub_items = re.split(r"[●•○◆]", title)
                 for item in sub_items:
                     item = item.strip(" -–—:,;")
-                    if item and len(item) >= 3 and not _line_is_noise(item) and len(item.split()) <= 12:
-                        topics.append(Topic(
-                            title=_normalize_title(item)[:160],
-                            cues=["objectives"],
-                            source={"page": page_num, "line": ln},
-                        ))
+                    if not item or len(item) < 3:
+                        continue
+                    # Reject prose continuation (starts lowercase)
+                    if item[0].islower():
+                        continue
+                    # Reject sentence-style learning outcomes (ends with period + >= 5 words)
+                    if item.endswith('.') and len(item.split()) >= 5:
+                        continue
+                    if _line_is_noise(item) or len(item.split()) > 12:
+                        continue
+                    topics.append(Topic(
+                        title=_normalize_title(item)[:160],
+                        cues=["objectives"],
+                        source={"page": page_num, "line": ln},
+                    ))
                 break
 
         # Also handle inline bullet separation on same line (no leading bullet)
@@ -462,6 +508,10 @@ def _extract_topics_objectives(lines: list[str], page_num: int) -> list[Topic]:
         if in_section and "●" in ln:
             for part in ln.split("●"):
                 part = part.strip(" -–—:,;")
+                if not part or part[0].islower():
+                    continue
+                if part.endswith('.') and len(part.split()) >= 5:
+                    continue
                 if part and len(part) >= 3 and not _line_is_noise(part) and len(part.split()) <= 10:
                     topics.append(Topic(
                         title=_normalize_title(part)[:160],
@@ -512,49 +562,93 @@ def _extract_topics_multicolumn_table(raw_lines: list[str], page_num: int) -> li
     return topics
 
 
-def _extract_topics_numbered_in_section(lines: list[str], page_num: int) -> list[Topic]:
+def _extract_topics_numbered_in_section(
+    tagged_lines: list[tuple[str, int]],
+) -> list[Topic]:
     """
     Numbered list items inside a detected topic/schedule section.
-    e.g.  1. Introduction  2. Data Types  3. Functions
+    Accepts cross-page tagged_lines so section state persists across page boundaries.
+    Handles both `1. Title` and `1 Title` (space-only) numbering formats.
     """
     topics: list[Topic] = []
     in_topic_section = False
+    course_desc_active = False  # True when activated specifically by "course description"
+    current_page: int | None = None
     enum_re = re.compile(r"^\s*(\d{1,2})[.)]\s+(.+)$")
+    enum_space_re = re.compile(r"^\s*(\d{1,2})\s+(.{2,100})$")
 
-    for ln in lines:
+    for ln, page_num in tagged_lines:
+        # At a page boundary, reset sections NOT rooted in "course description".
+        # This prevents schedule-type sections from leaking through to the next page's
+        # bibliography/appendix content (e.g. GRK-620, syl54739).
+        if page_num != current_page:
+            current_page = page_num
+            if in_topic_section and not course_desc_active:
+                in_topic_section = False
+
         low = ln.lower().strip()
-        if any(h in low for h in _TOPIC_SECTION_HINTS):
+        if _TOPIC_SECTION_RE.search(low):
             in_topic_section = True
-        if any(h in low for h in _TOPIC_SECTION_END_HINTS):
+            course_desc_active = "course description" in low
+        if _TOPIC_SECTION_END_RE.search(low):
             in_topic_section = False
+            course_desc_active = False
 
         if not in_topic_section:
             continue
+
         m = enum_re.match(ln)
-        if m:
-            title = m.group(2).strip()
-            # Skip grading-weight items like "3. Weekly homework (50%): ..."
-            if re.search(r"\d+\.?\d*%", title):
-                continue
-            # Skip bibliography/book references (contain publisher keywords or "Author, Firstname, Title" pattern)
-            if re.search(
-                r"\b(?:Oxford|Cambridge|University Press|Publishing|Monographs|Theological|Eerdmans|Zondervan|Pearson|Macmillan|Routledge|edition|ed\.)\b",
-                title, re.IGNORECASE
-            ):
-                continue
-            # "Surname, Firstname/Initial, Book title..." format (bibliography entry)
-            if re.match(r"^[A-Z][a-z]+,\s*(?:[A-Z][a-z]+|[A-Z]\.?)[,\s]", title):
-                continue
-            # Skip comma-separated assessment-type lists (e.g. "Quiz, MCQ, Assignment, etc")
-            _ASSESS_TERMS = ["quiz", "mcq", "exam", "assignment", "homework", "test"]
-            if sum(1 for k in _ASSESS_TERMS if k in title.lower()) >= 2:
-                continue
-            if title and not _line_is_noise(title) and len(title.split()) <= 12:
-                topics.append(Topic(
-                    title=_normalize_title(title)[:160],
-                    cues=["numbered_in_section"],
-                    source={"page": page_num, "line": ln},
-                ))
+        use_space_format = False
+        if not m:
+            m = enum_space_re.match(ln)
+            use_space_format = m is not None
+        if not m:
+            continue
+
+        title = m.group(2).strip()
+
+        # Strip leading "N " prefix from double-numbered lines like "1. 1 Crystal Structure"
+        title = re.sub(r"^\d+\s+", "", title).strip()
+
+        # Strip trailing section-header colons ("Introduction:")
+        title = title.rstrip(" :")
+
+        # Strip trailing lab-hours credit digit (e.g. "Measurement of DC Voltage 3")
+        title = re.sub(r"\s+\d+\s*$", "", title).strip()
+
+        # Skip rows where the captured title is itself a date (date-column table row captured as numbered)
+        if re.match(r"^\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?", title):
+            continue
+
+        # For space-format lines, require title to start uppercase or digit (not prose continuation)
+        if use_space_format and title and title[0].islower():
+            continue
+
+        # Require minimum meaningful length
+        if len(title) < 4:
+            continue
+
+        # Skip grading-weight items like "3. Weekly homework (50%): ..."
+        if re.search(r"\d+\.?\d*%", title):
+            continue
+        # Skip bibliography/book references (publisher keywords or Author,Firstname pattern)
+        if re.search(
+            r"\b(?:Oxford|Cambridge|University Press|Publishing|Monographs|Theological|Eerdmans|Zondervan|Pearson|Macmillan|Routledge|McGraw|edition|ed\.)\b",
+            title, re.IGNORECASE
+        ):
+            continue
+        if re.match(r"^[A-Z][a-z]+,\s*(?:[A-Z][a-z]+|[A-Z]\.?)[,\s]", title):
+            continue
+        # Skip comma-separated assessment-type lists (e.g. "Quiz, MCQ, Assignment, etc")
+        _ASSESS_TERMS = ["quiz", "mcq", "exam", "assignment", "homework", "test"]
+        if sum(1 for k in _ASSESS_TERMS if k in title.lower()) >= 2:
+            continue
+        if title and not _line_is_noise(title) and len(title.split()) <= 12:
+            topics.append(Topic(
+                title=_normalize_title(title)[:160],
+                cues=["numbered_in_section"],
+                source={"page": page_num, "line": ln},
+            ))
     return topics
 
 
@@ -764,7 +858,17 @@ def extract_course_model_from_pages(
         )
 
     # ── Topics ────────────────────────────────────────────────────────────────
-    all_topics: list[Topic] = []
+    # Build cross-page tagged lines for strategy 4 (section state must persist across pages)
+    all_tagged_lines: list[tuple[str, int]] = []
+    for page in pages:
+        for ln in page.text.splitlines():
+            if ln.strip():
+                all_tagged_lines.append((_normalize_line(ln.strip()), page.page_number))
+
+    # Strategy 4 runs first: numbered items inside Course Description sections.
+    # Running first gives these topics priority in dedup over objectives-section extractions.
+    all_topics: list[Topic] = _extract_topics_numbered_in_section(all_tagged_lines)
+
     for page in pages:
         raw_lines = [ln for ln in page.text.splitlines() if ln.strip()]
         norm_lines = [_normalize_line(ln.strip()) for ln in page.text.splitlines() if ln.strip()]
@@ -775,14 +879,11 @@ def extract_course_model_from_pages(
         # Strategy 2: Date-column table rows (Jan 13   Introduction to Databases)
         all_topics.extend(_extract_topics_date_column(norm_lines, page.page_number, default_year))
 
-        # Strategy 3: Course Objectives / Learning Outcomes bullet points
-        all_topics.extend(_extract_topics_objectives(norm_lines, page.page_number))
-
-        # Strategy 4: Numbered list inside a detected topic section
-        all_topics.extend(_extract_topics_numbered_in_section(norm_lines, page.page_number))
-
         # Strategy 5: Multi-column table (raw lines to preserve 3+ space separators)
         all_topics.extend(_extract_topics_multicolumn_table(raw_lines, page.page_number))
+
+        # Strategy 3: Course Objectives / Learning Outcomes bullet points (lowest priority)
+        all_topics.extend(_extract_topics_objectives(norm_lines, page.page_number))
 
     # Deduplicate by title (case-insensitive), prefer earlier / higher-priority strategies
     seen_titles: dict[str, Topic] = {}
