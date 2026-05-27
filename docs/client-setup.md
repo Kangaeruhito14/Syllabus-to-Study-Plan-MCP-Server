@@ -130,10 +130,10 @@ After enabling in any client, ask the AI:
 
 > "List all tools from the syllabus-to-study-plan MCP server"
 
-You should see 10 tools:
+You should see 11 tools:
 `get_raw_text`, `parse_syllabus`, `detect_exam_dates`, `apply_course_corrections`,
 `weight_topics`, `generate_study_plan`, `build_plan_report`, `export_plan`,
-`setup_notion_database`, `full_pipeline`
+`setup_notion_database`, `setup_daily_notion_database`, `full_pipeline`
 
 Then run a quick test:
 
