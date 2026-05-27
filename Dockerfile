@@ -11,8 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 RUN pip install --no-cache-dir -e "."
 
-# Transport: "streamable-http" (modern MCP) or "sse" (legacy)
-ENV TRANSPORT=streamable-http
+# Default: stdio (for MCPize / mcp-proxy). Override with TRANSPORT=streamable-http for self-hosted HTTP.
 ENV HOST=0.0.0.0
 ENV PORT=8000
 
