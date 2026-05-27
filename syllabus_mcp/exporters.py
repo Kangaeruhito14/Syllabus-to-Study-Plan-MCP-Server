@@ -149,9 +149,9 @@ def plan_to_ics(plan: StudyPlan, *, study_start_hour: int = 20, session_gap_minu
         current_minute = 0
 
         for s in day_sessions:
-            start = datetime.combine(
-                day_date, datetime.min.time()
-            ).replace(hour=current_hour, minute=current_minute, tzinfo=timezone.utc)
+            day_start = datetime.combine(day_date, datetime.min.time(), tzinfo=timezone.utc)
+            offset_mins = current_hour * 60 + current_minute
+            start = day_start + timedelta(minutes=offset_mins)
             end = start + timedelta(minutes=int(s.estimated_minutes))
             summary = f"[{s.session_type.value}] {s.topic_title}"
             desc = "\n".join(s.rationale) if s.rationale else ""

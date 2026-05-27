@@ -574,6 +574,8 @@ def apply_course_corrections(inp: CourseCorrectionInput) -> CourseCorrectionOutp
     dated = [a.scheduled_date for a in course.assessments if a.scheduled_date]
     if dated:
         course.end_date = max(dated)
+    elif remove_assessment_set:
+        course.end_date = None
 
     return CourseCorrectionOutput(course=course, changes_applied=changes, warnings=warnings)
 
