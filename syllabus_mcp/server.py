@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from datetime import date, datetime, timezone
 from typing import Any, Literal
 
@@ -1297,7 +1298,13 @@ def full_pipeline(inp: FullPipelineInput) -> FullPipelineOutput:
 
 
 def main() -> None:
-    mcp.run()
+    transport = os.environ.get("TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+    else:
+        host = os.environ.get("HOST", "0.0.0.0")
+        port = int(os.environ.get("PORT", "8000"))
+        mcp.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":

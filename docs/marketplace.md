@@ -23,19 +23,22 @@ Students receive a 10–30 page syllabus and have no idea how to turn it into "w
 5. Generates a realistic day-by-day schedule with spaced repetition and buffer days
 6. Exports a polished readable report + pushes to tools students actually use
 
-## Tools (8 total)
+## Tools (11 total)
 
 ### Quick start — one call does everything
-- `full_pipeline`: Upload syllabus → get complete plan + readable report + ICS export in a single tool call. Accepts `manual_exam_dates` for week-based syllabi. **Start here.**
+- `full_pipeline`: Syllabus → plan → export in one call. Supports coverage mode, spaced repetition mode, tutorial scheduling, all export formats, and dynamic re-sync. **Start here.**
 
-### Step-by-step tools (for more control)
-- `parse_syllabus`: PDF (base64) or plain text → normalized CourseModel with topics, assessments, confidence scores, and constraints
+### Step-by-step tools (for fine control — spaced repetition mode only)
+- `get_raw_text`: Returns extracted text of any input + `is_likely_syllabus` confidence score
+- `parse_syllabus`: PDF (base64) or plain text → CourseModel with topics, assessments, confidence scores
 - `detect_exam_dates`: Refine assessments and exam dates; warns about missing dates
-- `apply_course_corrections`: Fix course title, add/remove topics, add/remove/update assessments and exam dates — the human-in-the-loop correction step
-- `weight_topics`: Assign importance scores to topics with rationale (uses keyword cues + boost_keywords)
-- `generate_study_plan`: Build a day-by-day schedule with spaced repetition, buffer days, and configurable hours/days-off/intensity
-- `build_plan_report`: Generate a polished natural-language summary with exam countdown, weekly hours view, priority topic list, and first sessions preview
-- `export_plan`: Export to `json` | `ics` | `google_calendar` | `notion`
+- `apply_course_corrections`: Fix course title, add/remove topics, add/remove/update assessments and exam dates
+- `weight_topics`: Assign importance scores to topics with rationale
+- `generate_study_plan`: Day-by-day schedule with spaced repetition (use `full_pipeline` for coverage mode)
+- `build_plan_report`: Polished markdown summary with exam countdown, weekly hours, priority topics
+- `export_plan`: Export to `json` | `ics` | `google_calendar` | `notion` (not `notion_daily` — use `full_pipeline`)
+- `setup_notion_database`: Create Notion DB for session-based export (one row per session)
+- `setup_daily_notion_database`: Create Notion DB for daily plan (one row per day: Topics, Details, Total Minutes, Done checkbox)
 
 ## Typical flow
 
