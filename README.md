@@ -159,6 +159,10 @@ Google Calendar and Notion update automatically. No manual edits.
 
 ### Step-by-step tools (for fine control)
 
+> **Important:** The step-by-step chain below only supports **spaced repetition mode**.
+> Coverage mode (interleaved review, tutorial-aware scheduling, `notion_daily` export) is available
+> **exclusively through `full_pipeline`**. If you want coverage mode, use `full_pipeline` — not this chain.
+
 | Tool | What it does |
 |---|---|
 | `get_raw_text` | Returns the full extracted text of any input (PDF/DOCX/HTML/URL/text). Use this when extraction looks wrong — read the text yourself and fix with `apply_course_corrections`. Also returns `is_likely_syllabus` confidence score. |
@@ -166,28 +170,41 @@ Google Calendar and Notion update automatically. No manual edits.
 | `detect_exam_dates` | Refines assessments and exam dates with confidence and missing-date warnings. |
 | `apply_course_corrections` | Fix anything in a `CourseModel`: title, timezone, add/remove topics, add/update/remove assessments, override dates. |
 | `weight_topics` | Assigns importance scores to topics (used by spaced repetition mode to prioritise). |
-| `generate_study_plan` | `CourseModel` + `StudyPreferences` → `StudyPlan` with spaced repetition. For coverage mode use `full_pipeline`. |
+| `generate_study_plan` | `CourseModel` + `StudyPreferences` → `StudyPlan` with **spaced repetition only**. For coverage mode (interleaved review, tutorial scheduling) use `full_pipeline` instead. |
 | `build_plan_report` | `CourseModel` + `StudyPlan` → polished Markdown report (exam countdown, weekly hours, priority topics, first 7 sessions). |
-| `export_plan` | `StudyPlan` → ICS / JSON / Notion (sessions) / Google Calendar. Requires credentials for live exports. |
+| `export_plan` | `StudyPlan` → ICS / JSON / Notion (sessions) / Google Calendar. Requires credentials for live exports. Does **not** support `notion_daily` — use `full_pipeline` for that. |
 | `setup_notion_database` | Creates a Notion database for session-based export (one row per session). Run once, use the returned `database_id`. |
 | `setup_daily_notion_database` | Creates a Notion database for the daily plan (one row per day: Date, Topics, Details, Total Minutes, Done checkbox). Run once, use the returned `database_id` as `notion_daily_database_id`. |
 
-### Step-by-step flow
+### Step-by-step flow (spaced repetition mode only)
 
 ```
 parse_syllabus
     ↓
-detect_exam_dates          (skip for coverage mode)
+detect_exam_dates          ← exam dates required for this mode
     ↓
 apply_course_corrections   ← fix anything wrong or missing
     ↓
 weight_topics
     ↓
-generate_study_plan        (spaced_repetition mode)
-    ↓                   OR  generate_coverage_plan (via full_pipeline)
+generate_study_plan        ← spaced repetition mode only
+    ↓
 build_plan_report
     ↓
-export_plan → ics / json / notion / notion_daily / google_calendar
+export_plan → ics / json / notion / google_calendar
+              (notion_daily not available here — use full_pipeline)
+```
+
+### Coverage mode flow (use full_pipeline)
+
+```
+full_pipeline (plan_mode="coverage")
+  ├─ content_type + content   ← your syllabus
+  ├─ course_start_date + study_end_date
+  ├─ next_day_review=true     ← interleaved learn+review (default)
+  ├─ tutorial_dates           ← optional, add anytime
+  ├─ export_format            ← notion_daily / google_calendar / ics / json
+  └─ credentials              ← notion_token / gcal_* tokens
 ```
 
 ---
