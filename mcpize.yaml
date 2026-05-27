@@ -1,0 +1,28 @@
+# MCPize Configuration
+# Docs: https://mcpize.com/docs/mcpize-yaml
+
+version: 1
+
+name: "Syllabus to Study Plan"
+slug: "syllabus-to-study-plan"
+
+runtime: python
+entry: "syllabus_mcp.server:main"
+
+build:
+  install: "pip install ."
+  dockerfile: "Dockerfile"
+
+start:
+  type: stdio
+  command: "python"
+  args:
+    - "-m"
+    - "syllabus_mcp.server"
+
+bridge:
+  mode: stdio
+
+credentials:
+  - name: "NOTION_TOKEN"
+  - name: "GCAL_ACCESS_TOKEN"
